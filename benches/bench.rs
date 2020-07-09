@@ -1,6 +1,5 @@
 #![feature(test)]
 
-extern crate columnation;
 extern crate test;
 
 use columnation::*;

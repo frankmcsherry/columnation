@@ -143,6 +143,10 @@ pub mod option {
             <Self as ColumnarRegion<T>>::clear(self);
         }
     }
+
+    impl<T: Columnation> Columnation for Option<T> {
+        type InnerRegion = T::InnerRegion;
+    }
 }
 
 /// Implementations for `Result<T: Columnation, E: Columnation>`.
@@ -170,7 +174,7 @@ pub mod result {
     }
 }
 
-/// Implementations for `Vec<T: Columnation>` and `&[T: Columnation]`.
+/// Implementations for `Vec<T: Columnation>`.
 pub mod vec {
 
     use super::{Columnation, ColumnarRegion};
@@ -202,10 +206,6 @@ pub mod vec {
     }
 
     impl<T: Columnation> Columnation for Vec<T> {
-        type InnerRegion = VecRegion<T>;
-    }
-
-    impl<'a, T: Columnation> Columnation for &'a [T] {
         type InnerRegion = VecRegion<T>;
     }
 
@@ -250,51 +250,9 @@ pub mod vec {
             std::mem::forget(read);
         }
     }
-
-    impl<'a, T: Columnation> ColumnarRegion<&'a [T]> for VecRegion<T> {
-        fn clear(&mut self) {
-            for buffer in self.local.iter_mut() {
-                unsafe {
-                    buffer.set_len(0);
-                }
-            }
-            self.inner.clear();
-        }
-        #[inline]
-        unsafe fn copy(&mut self, item: *mut &'a [T]) {
-            // We need to ensure there is an allocation which can
-            // absorb all of the elements of `item`, which may mean
-            // introducing a new buffer.
-            let available =
-            self.local
-                .last()
-                .map(|b| b.capacity() - b.len())
-                .unwrap_or(0);
-
-            let read = std::ptr::read(item);
-            let item_len = read.len();
-            if item_len > available {
-                // Increase available length in powers of two.
-                // We could choose a different rule here if we
-                // wanted to be more conservative with memory.
-                let len = self.local.len();
-                self.local.push(Vec::with_capacity(std::cmp::max(item_len, 1 << len)));
-            }
-
-            let buffer = self.local.last_mut().unwrap();
-            let ptr = (buffer.as_ptr() as *mut T).add(buffer.len());
-            ptr.copy_from_nonoverlapping(read.as_ptr(), item_len);
-            for i in 0 .. item_len {
-                self.inner.copy(ptr.add(i))
-            }
-            buffer.set_len(buffer.len() + item_len);
-            std::ptr::write(item, std::slice::from_raw_parts(ptr, item_len));
-            std::mem::forget(read);
-        }
-    }
 }
 
-/// Implementation for `String` and `&str`.
+/// Implementation for `String`.
 pub mod string {
 
     use super::{Columnation, ColumnarRegion};
@@ -322,10 +280,6 @@ pub mod string {
     }
 
     impl Columnation for String {
-        type InnerRegion = StringStack;
-    }
-
-    impl<'a> Columnation for &'a str {
         type InnerRegion = StringStack;
     }
 
@@ -367,43 +321,6 @@ pub mod string {
         }
     }
 
-    impl<'a> ColumnarRegion<&'a str> for StringStack {
-        fn clear(&mut self) {
-            for buffer in self.local.iter_mut() {
-                unsafe {
-                    buffer.set_len(0);
-                }
-            }
-         }
-        #[inline(always)] unsafe fn copy(&mut self, item: *mut &'a str) {
-            // We need to ensure there is an allocation which can
-            // absorb all of the elements of `item`, which may mean
-            // introducing a new buffer.
-            let available =
-            self.local
-                .last()
-                .map(|b| b.capacity() - b.len())
-                .unwrap_or(0);
-
-            let read = std::ptr::read(item);
-            let item_len = read.len();
-
-            if item_len > available {
-                // Increase available length in powers of two.
-                // We could choose a different rule here if we
-                // wanted to be more conservative with memory.
-                let len = self.local.len();
-                self.local.push(Vec::with_capacity(std::cmp::max(item_len, 1 << len)));
-            }
-
-            let buffer = self.local.last_mut().unwrap();
-            let ptr = (buffer.as_ptr() as *mut u8).add(buffer.len());
-            ptr.copy_from_nonoverlapping(read.as_ptr(), item_len);
-            buffer.set_len(buffer.len() + item_len);
-            std::ptr::write(item, std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, item_len)));
-            std::mem::forget(read);
-        }
-    }
 }
 
 /// Implementation for tuples. Macros seemed hard.

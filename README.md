@@ -31,7 +31,7 @@ for _ in 0 .. 1024 {
 // At this point, `my_region` has just tens of allocations,
 // despite presenting as if a thousand records which would
 // normally have a thousand allocations behind each of them.
-assert_eq!(&my_region[..], &my_data[..]);
+assert_eq!(&my_region[..], &my_vec[..]);
 ```
 
 ## Measurements
