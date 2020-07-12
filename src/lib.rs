@@ -154,12 +154,10 @@ pub mod result {
 
     impl<T: Columnation, E: Columnation> ColumnarRegion<Result<T, E>> for (T::InnerRegion, E::InnerRegion) {
         unsafe fn copy(&mut self, item: *mut Result<T,E>) {
-            let mut read = std::ptr::read(item);
-            match &mut read {
+            match &mut *item {
                 Ok(item) => self.0.copy(item),
                 Err(item) => self.1.copy(item),
             }
-            std::mem::forget(read);
         }
         fn clear(&mut self) {
             self.0.clear();
