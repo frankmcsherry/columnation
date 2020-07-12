@@ -133,11 +133,9 @@ pub mod option {
 
     impl<T: Columnation> ColumnarRegion<Option<T>> for T::InnerRegion {
         unsafe fn copy(&mut self, item: *mut Option<T>) {
-            let mut read = std::ptr::read(item);
-            if let Some(item) = &mut read {
+            if let Some(item) = &mut *item {
                 <Self as ColumnarRegion<T>>::copy(self, item);
             }
-            std::mem::forget(read);
         }
         fn clear(&mut self) {
             <Self as ColumnarRegion<T>>::clear(self);
