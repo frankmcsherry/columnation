@@ -16,10 +16,9 @@
 pub trait ColumnarRegion<T> : Default {
     /// Add a new element to the region.
     ///
-    /// The argument is a valid pointer which can be read, although the
-    /// method is required to copy its owned resources in to the region
-    /// and then update `item` to reference the new locations.
-    unsafe fn copy(&mut self, item: *mut T);
+    /// The argument will be copied in to the region and returned as an
+    /// owned instance. It is unsafe to drop the result.
+    unsafe fn copy(&mut self, item: &T) -> T;
     /// Retain allocations but discard their contents.
     ///
     /// The elements in the region do not actually own resources, and
@@ -56,9 +55,7 @@ impl<T: Columnation> ColumnStack<T> {
     /// The element can be read by indexing
     pub fn copy(&mut self, item: &T) {
         unsafe {
-            let mut read = std::ptr::read(item);
-            self.inner.copy(&mut read);
-            self.local.push(read);
+            self.local.push(self.inner.copy(item));
         }
     }
     /// Empties the collection.
@@ -101,7 +98,9 @@ impl<T: Columnation> Default for ColumnStack<T> {
 macro_rules! implement_columnation {
     ($index_type:ty) => (
         impl ColumnarRegion<$index_type> for () {
-            #[inline(always)] unsafe fn copy(&mut self, _item: *mut $index_type) { }
+            #[inline(always)] unsafe fn copy(&mut self, item: &$index_type) -> $index_type {
+                *item
+            }
             #[inline(always)] fn clear(&mut self) { }
         }
         impl Columnation for $index_type {
@@ -132,12 +131,8 @@ pub mod option {
     use super::{Columnation, ColumnarRegion};
 
     impl<T: Columnation> ColumnarRegion<Option<T>> for T::InnerRegion {
-        unsafe fn copy(&mut self, item: *mut Option<T>) {
-            let mut read = std::ptr::read(item);
-            if let Some(item) = &mut read {
-                <Self as ColumnarRegion<T>>::copy(self, item);
-            }
-            std::mem::forget(read);
+        unsafe fn copy(&mut self, item: &Option<T>) -> Option<T> {
+            item.as_ref().map(|inner| <Self as ColumnarRegion<T>>::copy(self, inner))
         }
         fn clear(&mut self) {
             <Self as ColumnarRegion<T>>::clear(self);
@@ -155,13 +150,12 @@ pub mod result {
     use super::{Columnation, ColumnarRegion};
 
     impl<T: Columnation, E: Columnation> ColumnarRegion<Result<T, E>> for (T::InnerRegion, E::InnerRegion) {
-        unsafe fn copy(&mut self, item: *mut Result<T,E>) {
-            let mut read = std::ptr::read(item);
-            match &mut read {
-                Ok(item) => self.0.copy(item),
-                Err(item) => self.1.copy(item),
+        // unsafe fn copy(&mut self, item: *mut Result<T,E>) {
+        unsafe fn copy(&mut self, item: &Result<T, E>) -> Result<T,E> {
+            match item {
+                Ok(item) => { Ok(self.0.copy(item)) },
+                Err(item) => { Err(self.1.copy(item)) },
             }
-            std::mem::forget(read);
         }
         fn clear(&mut self) {
             self.0.clear();
@@ -219,7 +213,7 @@ pub mod vec {
             self.inner.clear();
         }
         #[inline]
-        unsafe fn copy(&mut self, item: *mut Vec<T>) {
+        unsafe fn copy(&mut self, item: &Vec<T>) -> Vec<T> {
             // We need to ensure there is an allocation which can
             // absorb all of the elements of `item`, which may mean
             // introducing a new buffer.
@@ -229,25 +223,19 @@ pub mod vec {
                 .map(|b| b.capacity() - b.len())
                 .unwrap_or(0);
 
-            let read = std::ptr::read(item);
-            let item_len = read.len();
-            if item_len > available {
+            if item.len() > available {
                 // Increase available length in powers of two.
                 // We could choose a different rule here if we
                 // wanted to be more conservative with memory.
                 let len = self.local.len();
-                self.local.push(Vec::with_capacity(std::cmp::max(item_len, 1 << len)));
+                self.local.push(Vec::with_capacity(std::cmp::max(item.len(), 1 << len)));
             }
 
             let buffer = self.local.last_mut().unwrap();
             let ptr = (buffer.as_ptr() as *mut T).add(buffer.len());
-            ptr.copy_from_nonoverlapping(read.as_ptr(), item_len);
-            for i in 0 .. item_len {
-                self.inner.copy(ptr.add(i))
-            }
-            buffer.set_len(buffer.len() + item_len);
-            std::ptr::write(item, Vec::from_raw_parts(ptr, item_len, item_len));
-            std::mem::forget(read);
+            let inner = &mut self.inner;
+            buffer.extend(item.iter().map(|element| inner.copy(element)));
+            Vec::from_raw_parts(ptr, item.len(), item.len())
         }
     }
 }
@@ -291,7 +279,7 @@ pub mod string {
                 }
             }
          }
-        #[inline(always)] unsafe fn copy(&mut self, item: *mut String) {
+        #[inline(always)] unsafe fn copy(&mut self, item: &String) -> String {
             // We need to ensure there is an allocation which can
             // absorb all of the elements of `item`, which may mean
             // introducing a new buffer.
@@ -301,23 +289,18 @@ pub mod string {
                 .map(|b| b.capacity() - b.len())
                 .unwrap_or(0);
 
-            let read = std::ptr::read(item);
-            let item_len = read.len();
-
-            if item_len > available {
+            if item.len() > available {
                 // Increase available length in powers of two.
                 // We could choose a different rule here if we
                 // wanted to be more conservative with memory.
                 let len = self.local.len();
-                self.local.push(Vec::with_capacity(std::cmp::max(item_len, 1 << len)));
+                self.local.push(Vec::with_capacity(std::cmp::max(item.len(), 1 << len)));
             }
 
             let buffer = self.local.last_mut().unwrap();
             let ptr = (buffer.as_ptr() as *mut u8).add(buffer.len());
-            ptr.copy_from_nonoverlapping(read.as_ptr(), item_len);
-            buffer.set_len(buffer.len() + item_len);
-            std::ptr::write(item, String::from_raw_parts(ptr, item_len, item_len));
-            std::mem::forget(read);
+            buffer.extend_from_slice(item.as_bytes());
+            String::from_raw_parts(ptr, item.len(), item.len())
         }
     }
 
@@ -337,9 +320,11 @@ pub mod tuple {
             self.0.clear();
             self.1.clear();
         }
-        #[inline(always)] unsafe fn copy(&mut self, item: *mut (T1,T2)) {
-            self.0.copy(&mut ((*item).0) as *mut T1);
-            self.1.copy(&mut ((*item).1) as *mut T2);
+        #[inline(always)] unsafe fn copy(&mut self, item: &(T1,T2)) -> (T1,T2) {
+            (
+                self.0.copy(&item.0),
+                self.1.copy(&item.1),
+            )
         }
     }
 
@@ -353,10 +338,12 @@ pub mod tuple {
             self.1.clear();
             self.2.clear();
         }
-        #[inline(always)] unsafe fn copy(&mut self, item: *mut (T1,T2,T3)) {
-            self.0.copy(&mut ((*item).0) as *mut T1);
-            self.1.copy(&mut ((*item).1) as *mut T2);
-            self.2.copy(&mut ((*item).2) as *mut T3);
+        #[inline(always)] unsafe fn copy(&mut self, item: &(T1,T2,T3)) -> (T1,T2,T3) {
+            (
+                self.0.copy(&item.0),
+                self.1.copy(&item.1),
+                self.2.copy(&item.2),
+            )
         }
     }
 }
