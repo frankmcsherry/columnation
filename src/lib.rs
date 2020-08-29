@@ -12,13 +12,15 @@
 //! keyword and Rust's safety is not yet clearly enough specified
 //! for me to make any stronger statements than that.
 
+use std::mem::ManuallyDrop;
+
 /// A type that can absorb owned data from type `T`.
 pub trait ColumnarRegion<T> : Default {
     /// Add a new element to the region.
     ///
     /// The argument will be copied in to the region and returned as an
     /// owned instance. It is unsafe to drop the result.
-    unsafe fn copy(&mut self, item: &T) -> T;
+    unsafe fn copy(&mut self, item: &T) -> ManuallyDrop<T>;
     /// Retain allocations but discard their contents.
     ///
     /// The elements in the region do not actually own resources, and
@@ -55,7 +57,7 @@ impl<T: Columnation> ColumnStack<T> {
     /// The element can be read by indexing
     pub fn copy(&mut self, item: &T) {
         unsafe {
-            self.local.push(self.inner.copy(item));
+            self.local.push(ManuallyDrop::into_inner(self.inner.copy(item)));
         }
     }
     /// Empties the collection.
@@ -98,8 +100,8 @@ impl<T: Columnation> Default for ColumnStack<T> {
 macro_rules! implement_columnation {
     ($index_type:ty) => (
         impl ColumnarRegion<$index_type> for () {
-            #[inline(always)] unsafe fn copy(&mut self, item: &$index_type) -> $index_type {
-                *item
+            #[inline(always)] unsafe fn copy(&mut self, item: &$index_type) -> ManuallyDrop<$index_type> {
+                ManuallyDrop::new(*item)
             }
             #[inline(always)] fn clear(&mut self) { }
         }
@@ -128,11 +130,12 @@ implement_columnation!(isize);
 /// Implementations for `Option<T: Columnation>`.
 pub mod option {
 
+    use std::mem::ManuallyDrop;
     use super::{Columnation, ColumnarRegion};
 
     impl<T: Columnation> ColumnarRegion<Option<T>> for T::InnerRegion {
-        unsafe fn copy(&mut self, item: &Option<T>) -> Option<T> {
-            item.as_ref().map(|inner| <Self as ColumnarRegion<T>>::copy(self, inner))
+        unsafe fn copy(&mut self, item: &Option<T>) -> ManuallyDrop<Option<T>> {
+            ManuallyDrop::new(item.as_ref().map(|inner| ManuallyDrop::into_inner(<Self as ColumnarRegion<T>>::copy(self, inner))))
         }
         fn clear(&mut self) {
             <Self as ColumnarRegion<T>>::clear(self);
@@ -147,15 +150,15 @@ pub mod option {
 /// Implementations for `Result<T: Columnation, E: Columnation>`.
 pub mod result {
 
+    use std::mem::ManuallyDrop;
     use super::{Columnation, ColumnarRegion};
 
     impl<T: Columnation, E: Columnation> ColumnarRegion<Result<T, E>> for (T::InnerRegion, E::InnerRegion) {
-        // unsafe fn copy(&mut self, item: *mut Result<T,E>) {
-        unsafe fn copy(&mut self, item: &Result<T, E>) -> Result<T,E> {
-            match item {
-                Ok(item) => { Ok(self.0.copy(item)) },
-                Err(item) => { Err(self.1.copy(item)) },
-            }
+        unsafe fn copy(&mut self, item: &Result<T, E>) -> ManuallyDrop<Result<T,E>> {
+            ManuallyDrop::new(match item {
+                Ok(item) => { Ok(ManuallyDrop::into_inner(self.0.copy(item))) },
+                Err(item) => { Err(ManuallyDrop::into_inner(self.1.copy(item))) },
+            })
         }
         fn clear(&mut self) {
             self.0.clear();
@@ -171,6 +174,7 @@ pub mod result {
 /// Implementations for `Vec<T: Columnation>`.
 pub mod vec {
 
+    use std::mem::ManuallyDrop;
     use super::{Columnation, ColumnarRegion};
 
     pub struct VecRegion<T: Columnation> {
@@ -213,7 +217,7 @@ pub mod vec {
             self.inner.clear();
         }
         #[inline]
-        unsafe fn copy(&mut self, item: &Vec<T>) -> Vec<T> {
+        unsafe fn copy(&mut self, item: &Vec<T>) -> ManuallyDrop<Vec<T>> {
             // We need to ensure there is an allocation which can
             // absorb all of the elements of `item`, which may mean
             // introducing a new buffer.
@@ -234,8 +238,8 @@ pub mod vec {
             let buffer = self.local.last_mut().unwrap();
             let ptr = (buffer.as_ptr() as *mut T).add(buffer.len());
             let inner = &mut self.inner;
-            buffer.extend(item.iter().map(|element| inner.copy(element)));
-            Vec::from_raw_parts(ptr, item.len(), item.len())
+            buffer.extend(item.iter().map(|element| ManuallyDrop::into_inner(inner.copy(element))));
+            ManuallyDrop::new(Vec::from_raw_parts(ptr, item.len(), item.len()))
         }
     }
 }
@@ -243,6 +247,7 @@ pub mod vec {
 /// Implementation for `String`.
 pub mod string {
 
+    use std::mem::ManuallyDrop;
     use super::{Columnation, ColumnarRegion};
 
     /// An apparently owning stack which does not drop its elements.
@@ -279,7 +284,7 @@ pub mod string {
                 }
             }
          }
-        #[inline(always)] unsafe fn copy(&mut self, item: &String) -> String {
+        #[inline(always)] unsafe fn copy(&mut self, item: &String) -> ManuallyDrop<String> {
             // We need to ensure there is an allocation which can
             // absorb all of the elements of `item`, which may mean
             // introducing a new buffer.
@@ -300,15 +305,15 @@ pub mod string {
             let buffer = self.local.last_mut().unwrap();
             let ptr = (buffer.as_ptr() as *mut u8).add(buffer.len());
             buffer.extend_from_slice(item.as_bytes());
-            String::from_raw_parts(ptr, item.len(), item.len())
+            ManuallyDrop::new(String::from_raw_parts(ptr, item.len(), item.len()))
         }
     }
-
 }
 
 /// Implementation for tuples. Macros seemed hard.
 pub mod tuple {
 
+    use std::mem::ManuallyDrop;
     use super::{Columnation, ColumnarRegion};
 
     impl<T1: Columnation, T2: Columnation> Columnation for (T1, T2) {
@@ -320,11 +325,11 @@ pub mod tuple {
             self.0.clear();
             self.1.clear();
         }
-        #[inline(always)] unsafe fn copy(&mut self, item: &(T1,T2)) -> (T1,T2) {
-            (
-                self.0.copy(&item.0),
-                self.1.copy(&item.1),
-            )
+        #[inline(always)] unsafe fn copy(&mut self, item: &(T1,T2)) -> ManuallyDrop<(T1,T2)> {
+            ManuallyDrop::new((
+                ManuallyDrop::into_inner(self.0.copy(&item.0)),
+                ManuallyDrop::into_inner(self.1.copy(&item.1)),
+            ))
         }
     }
 
@@ -338,12 +343,12 @@ pub mod tuple {
             self.1.clear();
             self.2.clear();
         }
-        #[inline(always)] unsafe fn copy(&mut self, item: &(T1,T2,T3)) -> (T1,T2,T3) {
-            (
-                self.0.copy(&item.0),
-                self.1.copy(&item.1),
-                self.2.copy(&item.2),
-            )
+        #[inline(always)] unsafe fn copy(&mut self, item: &(T1,T2,T3)) -> ManuallyDrop<(T1,T2,T3)> {
+            ManuallyDrop::new((
+                ManuallyDrop::into_inner(self.0.copy(&item.0)),
+                ManuallyDrop::into_inner(self.1.copy(&item.1)),
+                ManuallyDrop::into_inner(self.2.copy(&item.2)),
+            ))
         }
     }
 }
