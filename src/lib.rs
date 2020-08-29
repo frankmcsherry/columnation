@@ -19,7 +19,7 @@ pub trait ColumnarRegion<T> : Default {
     /// Add a new element to the region.
     ///
     /// The argument will be copied in to the region and returned as an
-    /// owned instance. It is unsafe to drop the result.
+    /// owned instance. It is unsafe to unwrap and then drop the result.
     unsafe fn copy(&mut self, item: &T) -> ManuallyDrop<T>;
     /// Retain allocations but discard their contents.
     ///
