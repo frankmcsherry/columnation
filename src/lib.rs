@@ -67,6 +67,20 @@ impl<T: Columnation> ColumnStack<T> {
             self.inner.clear();
         }
     }
+    /// Retain elements that pass a predicate, from a specified offset.
+    ///
+    /// This method may or may not reclaim memory in the inner region.
+    pub fn retain_from<P: FnMut(&T)->bool>(&mut self, index: usize, mut predicate: P) {
+        let mut write_position = index;
+        for position in index .. self.local.len() {
+            if predicate(&self[position]) {
+                // TODO: compact the inner region and update pointers.
+                self.local.swap(position, write_position);
+                write_position += 1;
+            }
+        }
+        self.local.truncate(write_position);
+    }
 }
 
 impl<T: Columnation> std::ops::Deref for ColumnStack<T> {
