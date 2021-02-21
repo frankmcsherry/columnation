@@ -40,24 +40,26 @@ I took various types of records, generally containing a thousand allocations or 
 
 ```
 running 16 tests
-test empty_clone      ... bench:       5,453 ns/iter (+/- 199)
-test empty_copy       ... bench:      11,042 ns/iter (+/- 134)
-test string10_clone   ... bench: 166,110,167 ns/iter (+/- 80,078,857)
-test string10_copy    ... bench:   9,157,063 ns/iter (+/- 949,290)
-test string20_clone   ... bench:  87,231,969 ns/iter (+/- 12,498,375)
-test string20_copy    ... bench:   5,000,124 ns/iter (+/- 464,245)
-test u32x2_clone      ... bench:   2,278,221 ns/iter (+/- 165,168)
-test u32x2_copy       ... bench:     741,297 ns/iter (+/- 196,473)
-test u64_clone        ... bench:   2,353,318 ns/iter (+/- 852,005)
-test u64_copy         ... bench:     801,995 ns/iter (+/- 24,183)
-test u8_u64_clone     ... bench:   2,322,168 ns/iter (+/- 206,600)
-test u8_u64_copy      ... bench:     801,955 ns/iter (+/- 22,525)
-test vec_u_s_clone    ... bench: 183,448,971 ns/iter (+/- 51,349,339)
-test vec_u_s_copy     ... bench:  10,999,465 ns/iter (+/- 5,863,004)
-test vec_u_vn_s_clone ... bench: 198,654,657 ns/iter (+/- 43,369,880)
-test vec_u_vn_s_copy  ... bench:  21,096,008 ns/iter (+/- 21,597,098)
+test empty_clone      ... bench:         835 ns/iter (+/- 114)
+test empty_copy       ... bench:       3,103 ns/iter (+/- 346)
+test string10_clone   ... bench: 108,914,118 ns/iter (+/- 7,864,343)
+test string10_copy    ... bench:   4,654,702 ns/iter (+/- 312,409)
+test string20_clone   ... bench:  59,302,789 ns/iter (+/- 8,014,183)
+test string20_copy    ... bench:   2,818,970 ns/iter (+/- 191,415)
+test u32x2_clone      ... bench:   1,920,494 ns/iter (+/- 198,815)
+test u32x2_copy       ... bench:     282,235 ns/iter (+/- 40,851)
+test u64_clone        ... bench:   1,951,842 ns/iter (+/- 129,288)
+test u64_copy         ... bench:     234,412 ns/iter (+/- 25,186)
+test u8_u64_clone     ... bench:   1,931,056 ns/iter (+/- 162,882)
+test u8_u64_copy      ... bench:     266,326 ns/iter (+/- 35,203)
+test vec_u_s_clone    ... bench: 120,642,691 ns/iter (+/- 9,124,488)
+test vec_u_s_copy     ... bench:   5,801,229 ns/iter (+/- 522,024)
+test vec_u_vn_s_clone ... bench: 134,171,625 ns/iter (+/- 18,599,137)
+test vec_u_vn_s_copy  ... bench:   8,580,739 ns/iter (+/- 451,180)
 ```
 In each case, other than the intentionally trivial `empty` case, the `_copy` version is markedly faster than the `_clone` version. This makes some sense, as we are able to re-use all of the allocations across runs in the `_copy` case and only the vector's spine in the `_clone` case (we could attempt more complicated buffer pooling, but we haven't done that here).
+
+The `empty` case has an interesting story. When consolidating the multiple `Vec<()>` allocations into one `Vec<()>`, we introduce the cost of maitnaining the length and capacity of that vector. It should be "unbounded" with a zero-sized type, but in fact we need to verify that it does not read `usize::MAX`. The `empty_clone` case does not need to do this, and optimizes to a `memcpy`, whereas the `empty_copy` case must check the capacity between each insertion.
 
 ## Description
 

@@ -92,9 +92,7 @@ impl<T: Columnation> std::ops::Deref for ColumnStack<T> {
 
 impl<T: Columnation> Drop for ColumnStack<T> {
     fn drop(&mut self) {
-        unsafe {
-            self.local.set_len(0);
-        }
+        self.clear();
     }
 }
 
@@ -191,27 +189,31 @@ pub mod vec {
     use std::mem::ManuallyDrop;
     use super::{Columnation, ColumnarRegion};
 
+    /// Region allocation for the contents of `Vec<T>` types.
+    ///
+    /// This struct specifically keeps a geometrically sized
+    /// stash of `Vec<T>` types that hold contiguous slices
+    /// that back the copied-in vectors, as well as an inner
+    /// region for whatever `T` might require.
+    ///
+    /// Importantly, our stash of vectors are allocated with
+    /// increasing capacity and never resized, which should
+    /// ensure that references to their contents stay valid.
     pub struct VecRegion<T: Columnation> {
-        local: Vec<Vec<T>>,
+        /// The active allocation into which we are writing.
+        local: Vec<T>,
+        /// All previously active allocations.
+        stash: Vec<Vec<T>>,
+        /// Any inner region allocations.
         inner: T::InnerRegion,
     }
 
-    impl<T: Columnation> Drop for VecRegion<T> {
-        fn drop(&mut self) {
-            for buffer in self.local.iter_mut() {
-                unsafe {
-                    buffer.set_len(0);
-                }
-            }
-        }
-    }
-
+    // Manually implement `Default` as `T` may not implement it.
     impl<T: Columnation> Default for VecRegion<T> {
         fn default() -> Self {
-            // We put an empty initial list in place to ensure that
-            // calls to `last()` always succeed.
             VecRegion {
-                local: vec![Vec::new()],
+                local: Vec::new(),
+                stash: Vec::new(),
                 inner: T::InnerRegion::default(),
             }
         }
@@ -223,36 +225,30 @@ pub mod vec {
 
     impl<T: Columnation> ColumnarRegion<Vec<T>> for VecRegion<T> {
         fn clear(&mut self) {
-            for buffer in self.local.iter_mut() {
-                unsafe {
+            unsafe {
+                self.local.set_len(0);
+                for buffer in self.stash.iter_mut() {
                     buffer.set_len(0);
                 }
             }
             self.inner.clear();
         }
-        #[inline]
         unsafe fn copy(&mut self, item: &Vec<T>) -> ManuallyDrop<Vec<T>> {
-            // We need to ensure there is an allocation which can
-            // absorb all of the elements of `item`, which may mean
-            // introducing a new buffer.
-            let available =
-            self.local
-                .last()
-                .map(|b| b.capacity() - b.len())
-                .unwrap_or(0);
 
-            if item.len() > available {
-                // Increase available length in powers of two.
-                // We could choose a different rule here if we
-                // wanted to be more conservative with memory.
-                let len = self.local.len();
-                self.local.push(Vec::with_capacity(std::cmp::max(item.len(), 1 << len)));
+            // Check if `item` fits into `self.local` without reallocation.
+            // If not, stash `self.local` and increase the allocation.
+            if item.len() > self.local.capacity() - self.local.len() {
+                // Increase allocated capacity in powers of two.
+                // We could choose a different rule here if we wanted to be
+                // more conservative with memory (e.g. page size allocations).
+                let len = self.stash.len();
+                let new_local = Vec::with_capacity(std::cmp::max(item.len(), 1 << len));
+                self.stash.push(std::mem::replace(&mut self.local, new_local));
             }
 
-            let buffer = self.local.last_mut().unwrap();
-            let ptr = (buffer.as_ptr() as *mut T).add(buffer.len());
+            let ptr = (self.local.as_ptr() as *mut T).add(self.local.len());
             let inner = &mut self.inner;
-            buffer.extend(item.iter().map(|element| ManuallyDrop::into_inner(inner.copy(element))));
+            self.local.extend(item.iter().map(|element| ManuallyDrop::into_inner(inner.copy(element))));
             ManuallyDrop::new(Vec::from_raw_parts(ptr, item.len(), item.len()))
         }
     }
@@ -272,18 +268,12 @@ pub mod string {
     /// by `inner`, which will be independently deallocated. Mainly,
     /// this means that the `Drop` implementation should zero out
     /// `stack` and carefully release the backing allocation.
+    #[derive(Default)]
     pub struct StringStack {
-        local: Vec<Vec<u8>>,
-    }
-
-    impl Default for StringStack {
-        fn default() -> Self {
-            // We put an empty initial list in place to ensure that
-            // calls to `last()` always succeed.
-            Self {
-                local: vec![Vec::new()],
-            }
-        }
+        /// The active allocation into which we are writing.
+        local: Vec<u8>,
+        /// All previously active allocations.
+        stash: Vec<Vec<u8>>,
     }
 
     impl Columnation for String {
@@ -292,33 +282,28 @@ pub mod string {
 
     impl ColumnarRegion<String> for StringStack {
         fn clear(&mut self) {
-            for buffer in self.local.iter_mut() {
-                unsafe {
+            unsafe {
+                self.local.set_len(0);
+                for buffer in self.stash.iter_mut() {
                     buffer.set_len(0);
                 }
             }
          }
         #[inline(always)] unsafe fn copy(&mut self, item: &String) -> ManuallyDrop<String> {
-            // We need to ensure there is an allocation which can
-            // absorb all of the elements of `item`, which may mean
-            // introducing a new buffer.
-            let available =
-            self.local
-                .last()
-                .map(|b| b.capacity() - b.len())
-                .unwrap_or(0);
 
-            if item.len() > available {
-                // Increase available length in powers of two.
-                // We could choose a different rule here if we
-                // wanted to be more conservative with memory.
-                let len = self.local.len();
-                self.local.push(Vec::with_capacity(std::cmp::max(item.len(), 1 << len)));
+            // Check if `item` fits into `self.local` without reallocation.
+            // If not, stash `self.local` and increase the allocation.
+            if item.len() > self.local.capacity() - self.local.len() {
+                // Increase allocated capacity in powers of two.
+                // We could choose a different rule here if we wanted to be
+                // more conservative with memory (e.g. page size allocations).
+                let len = self.stash.len();
+                let new_local = Vec::with_capacity(std::cmp::max(item.len(), 1 << len));
+                self.stash.push(std::mem::replace(&mut self.local, new_local));
             }
 
-            let buffer = self.local.last_mut().unwrap();
-            let ptr = (buffer.as_ptr() as *mut u8).add(buffer.len());
-            buffer.extend_from_slice(item.as_bytes());
+            let ptr = (self.local.as_ptr() as *mut u8).add(self.local.len());
+            self.local.extend_from_slice(item.as_bytes());
             ManuallyDrop::new(String::from_raw_parts(ptr, item.len(), item.len()))
         }
     }
