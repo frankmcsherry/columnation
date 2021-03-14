@@ -85,7 +85,9 @@ impl<T: Columnation> ColumnStack<T> {
                 write_position += 1;
             }
         }
-        self.local.truncate(write_position);
+        unsafe {
+            self.local.set_len(write_position);
+        }
     }
 }
 
@@ -125,7 +127,7 @@ pub struct StableRegion<T> {
 }
 
 // Manually implement `Default` as `T` may not implement it.
-impl<T: Columnation> Default for StableRegion<T> {
+impl<T> Default for StableRegion<T> {
     fn default() -> Self {
         Self {
             local: Vec::new(),
