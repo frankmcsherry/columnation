@@ -13,7 +13,13 @@
 //! for me to make any stronger statements than that.
 
 /// A type that can absorb owned data from type `T`.
-pub trait ColumnarRegion<T> : Default {
+///
+/// This type will ensure that absorbed data remain valid as long as the
+/// instance itself is valid. Responsible users will couple the lifetime
+/// of this instance with that of *all* instances it returns from `copy`.
+pub trait Region : Default {
+    /// The type of item the region contains.
+    type Item;
     /// Add a new element to the region.
     ///
     /// The argument will be copied in to the region and returned as an
@@ -24,20 +30,133 @@ pub trait ColumnarRegion<T> : Default {
     /// It is unsafe to use the result in any way other than to reference
     /// its contents, and then only for the lifetime of the columnar region.
     /// Correct uses of this method are very likely exclusive to this crate.
-    unsafe fn copy(&mut self, item: &T) -> T;
+    unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item;
     /// Retain allocations but discard their contents.
     ///
     /// The elements in the region do not actually own resources, and
-    /// their normal `Drop` implementations will not be called.
+    /// their normal `Drop` implementations will not be called. This method
+    /// should only be called after all instances returned by `copy` have
+    /// been disposed of, as this method may invalidate their contents.
     fn clear(&mut self);
 }
 
+/// A vacuous region that just clones items.
+pub struct CloneRegion<T> {
+    phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> Default for CloneRegion<T> {
+    fn default() -> Self {
+        Self { phantom: std::marker::PhantomData }
+    }
+}
+
+// Any type that implements clone can use a non-region that just clones items.
+impl<T: Clone> Region for CloneRegion<T> {
+    type Item = T;
+    #[inline(always)]
+    unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
+        item.clone()
+    }
+    #[inline(always)]
+    fn clear(&mut self) { }
+}
+
+
+/// A region allocator which holds items at stable memory locations.
+///
+/// Items once inserted will not me moved, and their locations in memory
+/// can be relied on by others, until the region is cleared.
+///
+/// This type accepts owned data, rather than references, and does not
+/// itself intent to implement `Region`. Rather, it is a useful building
+/// block for other less-safe code that wants allocated data to remain at
+/// fixed memory locations.
+pub struct StableRegion<T> {
+    /// The active allocation into which we are writing.
+    local: Vec<T>,
+    /// All previously active allocations.
+    stash: Vec<Vec<T>>,
+}
+
+// Manually implement `Default` as `T` may not implement it.
+impl<T> Default for StableRegion<T> {
+    fn default() -> Self {
+        Self {
+            local: Vec::new(),
+            stash: Vec::new(),
+        }
+    }
+}
+
+impl<T> StableRegion<T> {
+    /// Clears the contents without dropping any elements.
+    #[inline]
+    pub fn clear(&mut self) {
+        unsafe {
+            // Unsafety justified in that setting the length to zero exposes
+            // no invalid data.
+            self.local.set_len(0);
+            // Release allocations in `stash` without dropping their elements.
+            for mut buffer in self.stash.drain(..) {
+                buffer.set_len(0);
+            }
+        }
+    }
+    /// Copies an iterator of items into the region.
+    #[inline]
+    pub fn copy_iter<I>(&mut self, items: I) -> &mut [T]
+    where
+        I: Iterator<Item = T> + std::iter::ExactSizeIterator,
+    {
+        // Check if `item` fits into `self.local` without reallocation.
+        // If not, stash `self.local` and increase the allocation.
+        if items.len() > self.local.capacity() - self.local.len() {
+            // Increase allocated capacity in powers of two.
+            // We could choose a different rule here if we wanted to be
+            // more conservative with memory (e.g. page size allocations).
+            let next_len = (self.local.capacity() + 1).next_power_of_two();
+            let new_local = Vec::with_capacity(std::cmp::max(items.len(), next_len));
+            self.stash.push(std::mem::replace(&mut self.local, new_local));
+        }
+
+        let initial_len = self.local.len();
+        self.local.extend(items);
+        &mut self.local[initial_len ..]
+    }
+    /// Copies a slice of cloneable items into the region.
+    #[inline]
+    pub fn copy_slice(&mut self, items: &[T]) -> &mut [T]
+    where
+        T: Clone,
+    {
+        // Check if `item` fits into `self.local` without reallocation.
+        // If not, stash `self.local` and increase the allocation.
+        if items.len() > self.local.capacity() - self.local.len() {
+            // Increase allocated capacity in powers of two.
+            // We could choose a different rule here if we wanted to be
+            // more conservative with memory (e.g. page size allocations).
+            let next_len = (self.local.capacity() + 1).next_power_of_two();
+            let new_local = Vec::with_capacity(std::cmp::max(items.len(), next_len));
+            self.stash.push(std::mem::replace(&mut self.local, new_local));
+        }
+
+        let initial_len = self.local.len();
+        self.local.extend_from_slice(items);
+        &mut self.local[initial_len ..]
+    }
+}
+
+
 /// A type that can be stored in a columnar region.
+///
+/// This trait exists only to allow types to name the columnar region
+/// that should be used
 pub trait Columnation: Sized {
     /// The type of region capable of absorbing allocations owned by
     /// the `Self` type. Note: not allocations of `Self`, but of the
     /// things that it owns.
-    type InnerRegion: ColumnarRegion<Self>;
+    type InnerRegion: Region<Item = Self>;
 }
 
 
@@ -69,6 +188,8 @@ impl<T: Columnation> ColumnStack<T> {
     /// Empties the collection.
     pub fn clear(&mut self) {
         unsafe {
+            // Unsafety justified in that setting the length to zero exposes
+            // no invalid data.
             self.local.set_len(0);
             self.inner.clear();
         }
@@ -86,6 +207,8 @@ impl<T: Columnation> ColumnStack<T> {
             }
         }
         unsafe {
+            // Unsafety justified in that `write_position` is no greater than
+            // `self.local.len()` and so this exposes no invalid data.
             self.local.set_len(write_position);
         }
     }
@@ -93,6 +216,7 @@ impl<T: Columnation> ColumnStack<T> {
 
 impl<T: Columnation> std::ops::Deref for ColumnStack<T> {
     type Target = [T];
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         &self.local[..]
     }
@@ -114,103 +238,15 @@ impl<T: Columnation> Default for ColumnStack<T> {
 }
 
 
-
-/// A region allocator which holds items at stable memory locations.
-///
-/// Items once inserted will not me moved, and their locations in memory
-/// can be relied on by others, until the region is cleared.
-pub struct StableRegion<T> {
-    /// The active allocation into which we are writing.
-    local: Vec<T>,
-    /// All previously active allocations.
-    stash: Vec<Vec<T>>,
-}
-
-// Manually implement `Default` as `T` may not implement it.
-impl<T> Default for StableRegion<T> {
-    fn default() -> Self {
-        Self {
-            local: Vec::new(),
-            stash: Vec::new(),
-        }
-    }
-}
-
-impl<T> StableRegion<T> {
-    /// Clears the contents without dropping any elements.
-    #[inline]
-    pub fn clear(&mut self) {
-        unsafe {
-            self.local.set_len(0);
-            for buffer in self.stash.iter_mut() {
-                buffer.set_len(0);
-            }
-        }
-    }
-    /// Copies an iterator of items into the region.
-    #[inline]
-    pub fn copy_iter<I>(&mut self, items: I) -> &mut [T]
-    where
-        I: Iterator<Item = T> + std::iter::ExactSizeIterator,
-    {
-        // Check if `item` fits into `self.local` without reallocation.
-        // If not, stash `self.local` and increase the allocation.
-        if items.len() > self.local.capacity() - self.local.len() {
-            // Increase allocated capacity in powers of two.
-            // We could choose a different rule here if we wanted to be
-            // more conservative with memory (e.g. page size allocations).
-            let len = self.stash.len();
-            let new_local = Vec::with_capacity(std::cmp::max(items.len(), 1 << len));
-            self.stash.push(std::mem::replace(&mut self.local, new_local));
-        }
-
-        let initial_len = self.local.len();
-        self.local.extend(items);
-        &mut self.local[initial_len ..]
-    }
-    /// Copies a slice of cloneable items into the region.
-    #[inline]
-    pub fn copy_slice(&mut self, items: &[T]) -> &mut [T]
-    where
-        T: Clone,
-    {
-        // Check if `item` fits into `self.local` without reallocation.
-        // If not, stash `self.local` and increase the allocation.
-        if items.len() > self.local.capacity() - self.local.len() {
-            // Increase allocated capacity in powers of two.
-            // We could choose a different rule here if we wanted to be
-            // more conservative with memory (e.g. page size allocations).
-            let len = self.stash.len();
-            let new_local = Vec::with_capacity(std::cmp::max(items.len(), 1 << len));
-            self.stash.push(std::mem::replace(&mut self.local, new_local));
-        }
-
-        let initial_len = self.local.len();
-        self.local.extend_from_slice(items);
-        &mut self.local[initial_len ..]
-    }
-}
-
-
 mod implementations {
 
-    use super::{Columnation, ColumnarRegion, StableRegion};
+    use super::{Region, CloneRegion, StableRegion, Columnation};
 
-    // Implementations for non-owning types, whose implementations can
-    // simply be empty. This macro should only be used for types whose
-    // bit-wise copy is sufficient to clone the record.
+    // Implementations for types whose `clone()` suffices for the region.
     macro_rules! implement_columnation {
         ($index_type:ty) => (
-            impl ColumnarRegion<$index_type> for () {
-                #[inline(always)]
-                unsafe fn copy(&mut self, item: &$index_type) -> $index_type {
-                    *item
-                }
-                #[inline(always)]
-                fn clear(&mut self) { }
-            }
             impl Columnation for $index_type {
-                type InnerRegion = ();
+                type InnerRegion = CloneRegion<$index_type>;
             }
         )
     }
@@ -234,53 +270,67 @@ mod implementations {
     /// Implementations for `Option<T: Columnation>`.
     pub mod option {
 
-        use super::{Columnation, ColumnarRegion};
+        use super::{Columnation, Region};
 
-        impl<T: Columnation> ColumnarRegion<Option<T>> for T::InnerRegion {
+        #[derive(Default)]
+        pub struct OptionRegion<R: Region> {
+            region: R,
+        }
+
+        impl<R: Region> Region for OptionRegion<R> {
+            type Item = Option<R::Item>;
             #[inline(always)]
-            unsafe fn copy(&mut self, item: &Option<T>) -> Option<T> {
-                item.as_ref().map(|inner| <Self as ColumnarRegion<T>>::copy(self, inner))
+            unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
+                item.as_ref().map(|inner| self.region.copy(inner))
             }
             #[inline(always)]
             fn clear(&mut self) {
-                <Self as ColumnarRegion<T>>::clear(self);
+                self.region.clear();
             }
         }
 
         impl<T: Columnation> Columnation for Option<T> {
-            type InnerRegion = T::InnerRegion;
+            type InnerRegion = OptionRegion<T::InnerRegion>;
         }
     }
 
     /// Implementations for `Result<T: Columnation, E: Columnation>`.
     pub mod result {
 
-        use super::{Columnation, ColumnarRegion};
+        use super::{Columnation, Region};
 
-        impl<T: Columnation, E: Columnation> ColumnarRegion<Result<T, E>> for (T::InnerRegion, E::InnerRegion) {
+        #[derive(Default)]
+        pub struct ResultRegion<R1: Region, R2: Region> {
+            region1: R1,
+            region2: R2,
+        }
+
+
+        impl<R1: Region, R2: Region> Region for ResultRegion<R1, R2> {
+            type Item = Result<R1::Item, R2::Item>;
             #[inline(always)]
-            unsafe fn copy(&mut self, item: &Result<T, E>) -> Result<T,E> {
+            unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
                 match item {
-                    Ok(item) => { Ok(self.0.copy(item)) },
-                    Err(item) => { Err(self.1.copy(item)) },
+                    Ok(item) => { Ok(self.region1.copy(item)) },
+                    Err(item) => { Err(self.region2.copy(item)) },
                 }
             }
             #[inline(always)]
             fn clear(&mut self) {
-                self.0.clear();
-                self.1.clear();
+                self.region1.clear();
+                self.region2.clear();
             }
         }
 
         impl<T: Columnation, E: Columnation> Columnation for Result<T, E> {
-            type InnerRegion = (T::InnerRegion, E::InnerRegion);
+            type InnerRegion = ResultRegion<T::InnerRegion, E::InnerRegion>;
         }
     }
 
     /// Implementations for `Vec<T: Columnation>`.
     pub mod vec {
 
-        use super::{Columnation, ColumnarRegion, StableRegion};
+        use super::{Columnation, Region, StableRegion};
 
         /// Region allocation for the contents of `Vec<T>` types.
         ///
@@ -307,14 +357,15 @@ mod implementations {
             type InnerRegion = VecRegion<T>;
         }
 
-        impl<T: Columnation> ColumnarRegion<Vec<T>> for VecRegion<T> {
+        impl<T: Columnation> Region for VecRegion<T> {
+            type Item = Vec<T>;
             #[inline]
             fn clear(&mut self) {
                 self.region.clear();
                 self.inner.clear();
             }
-            #[inline]
-            unsafe fn copy(&mut self, item: &Vec<T>) -> Vec<T> {
+            #[inline(always)]
+            unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
                 // TODO: Some types `T` should just be cloned, with `copy_slice`.
                 // E.g. types that are `Copy` or vecs of ZSTs.
                 let inner = &mut self.inner;
@@ -327,7 +378,7 @@ mod implementations {
     /// Implementation for `String`.
     pub mod string {
 
-        use super::{Columnation, ColumnarRegion, StableRegion};
+        use super::{Columnation, Region, StableRegion};
 
         /// Region allocation for `String` data.
         ///
@@ -342,7 +393,8 @@ mod implementations {
             type InnerRegion = StringStack;
         }
 
-        impl ColumnarRegion<String> for StringStack {
+        impl Region for StringStack {
+            type Item = String;
             #[inline]
             fn clear(&mut self) {
                 self.region.clear();
@@ -359,42 +411,57 @@ mod implementations {
     /// Implementation for tuples. Macros seemed hard.
     pub mod tuple {
 
-        use super::{Columnation, ColumnarRegion};
+        use super::{Columnation, Region};
 
-        impl<T1: Columnation, T2: Columnation> Columnation for (T1, T2) {
-            type InnerRegion = (T1::InnerRegion, T2::InnerRegion);
+        impl<T0: Columnation, T1: Columnation> Columnation for (T0, T1) {
+            type InnerRegion = Tuple2Region<T0::InnerRegion, T1::InnerRegion>;
         }
 
-        impl<T1: Columnation, T2: Columnation> ColumnarRegion<(T1,T2)> for (T1::InnerRegion, T2::InnerRegion) {
+        #[derive(Default)]
+        pub struct Tuple2Region<R0: Region, R1: Region> {
+            region0: R0,
+            region1: R1,
+        }
+
+        impl<R0: Region, R1: Region> Region for Tuple2Region<R0, R1> {
+            type Item = (R0::Item, R1::Item);
             #[inline]
             fn clear(&mut self) {
-                self.0.clear();
-                self.1.clear();
+                self.region0.clear();
+                self.region1.clear();
             }
-            #[inline] unsafe fn copy(&mut self, item: &(T1,T2)) -> (T1,T2) {
+            #[inline] unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
                 (
-                    self.0.copy(&item.0),
-                    self.1.copy(&item.1),
+                    self.region0.copy(&item.0),
+                    self.region1.copy(&item.1),
                 )
             }
         }
 
-        impl<T1: Columnation, T2: Columnation, T3: Columnation> Columnation for (T1, T2, T3) {
-            type InnerRegion = (T1::InnerRegion, T2::InnerRegion, T3::InnerRegion);
+        impl<T0: Columnation, T1: Columnation, T2: Columnation> Columnation for (T0, T1, T2) {
+            type InnerRegion = Tuple3Region<T0::InnerRegion, T1::InnerRegion, T2::InnerRegion>;
         }
 
-        impl<T1: Columnation, T2: Columnation, T3: Columnation> ColumnarRegion<(T1,T2,T3)> for (T1::InnerRegion, T2::InnerRegion, T3::InnerRegion) {
+        #[derive(Default)]
+        pub struct Tuple3Region<R0: Region, R1: Region, R2: Region> {
+            region0: R0,
+            region1: R1,
+            region2: R2,
+        }
+
+        impl<R0: Region, R1: Region, R2: Region> Region for Tuple3Region<R0, R1, R2> {
+            type Item = (R0::Item, R1::Item, R2::Item);
             #[inline]
             fn clear(&mut self) {
-                self.0.clear();
-                self.1.clear();
-                self.2.clear();
+                self.region0.clear();
+                self.region1.clear();
+                self.region2.clear();
             }
-            #[inline] unsafe fn copy(&mut self, item: &(T1,T2,T3)) -> (T1,T2,T3) {
+            #[inline] unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
                 (
-                    self.0.copy(&item.0),
-                    self.1.copy(&item.1),
-                    self.2.copy(&item.2),
+                    self.region0.copy(&item.0),
+                    self.region1.copy(&item.1),
+                    self.region2.copy(&item.2),
                 )
             }
         }
