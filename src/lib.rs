@@ -12,6 +12,8 @@
 //! keyword and Rust's safety is not yet clearly enough specified
 //! for me to make any stronger statements than that.
 
+use std::borrow::Borrow;
+
 /// A type that can absorb owned data from type `T`.
 ///
 /// This type will ensure that absorbed data remain valid as long as the
@@ -175,6 +177,17 @@ pub struct ColumnStack<T: Columnation> {
 }
 
 impl<T: Columnation> ColumnStack<T> {
+    /// Construct a [ColumnStack], reserving space for `capacity` elements
+    ///
+    /// Note that the associated region is not initialized to a specific capacity
+    /// because we can't generally know how much space would be required.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            local: Vec::with_capacity(capacity),
+            inner: T::InnerRegion::default(),
+        }
+    }
+
     /// Copies an element in to the region.
     ///
     /// The element can be read by indexing
@@ -214,6 +227,34 @@ impl<T: Columnation> ColumnStack<T> {
     }
 }
 
+impl<A: Columnation, B: Columnation> ColumnStack<(A, B)> {
+    /// Copies a destructured tuple `(A, B)` into this column stack.
+    ///
+    /// This serves situations where a tuple should be constructed from its constituents but not
+    /// not all elements are available as owned data.
+    ///
+    /// The element can be read by indexing
+    pub fn copy_destructured(&mut self, t1: &A, t2: &B) {
+        unsafe {
+            self.local.push(self.inner.copy_destructured(t1, t2));
+        }
+    }
+}
+
+impl<A: Columnation, B: Columnation, C: Columnation> ColumnStack<(A, B, C)> {
+    /// Copies a destructured tuple `(A, B, C)` into this column stack.
+    ///
+    /// This serves situations where a tuple should be constructed from its constituents but not
+    /// not all elements are available as owned data.
+    ///
+    /// The element can be read by indexing
+    pub fn copy_destructured(&mut self, r0: &A, r1: &B, r2: &C) {
+        unsafe {
+            self.local.push(self.inner.copy_destructured(r0, r1, r2));
+        }
+    }
+}
+
 impl<T: Columnation> std::ops::Deref for ColumnStack<T> {
     type Target = [T];
     #[inline(always)]
@@ -237,6 +278,53 @@ impl<T: Columnation> Default for ColumnStack<T> {
     }
 }
 
+impl<T: Columnation, B: Borrow<T>> Extend<B> for ColumnStack<T> {
+    fn extend<I: IntoIterator<Item=B>>(&mut self, iter: I) {
+        for element in iter {
+            self.copy(element.borrow())
+        }
+    }
+}
+
+impl<A: Columnation, B: Borrow<A>> std::iter::FromIterator<B> for ColumnStack<A> {
+    fn from_iter<T: IntoIterator<Item=B>>(iter: T) -> Self {
+        let iter = iter.into_iter();
+        let mut c = ColumnStack::<A>::with_capacity(iter.size_hint().0);
+        c.extend(iter);
+        c
+    }
+}
+
+impl<T: Columnation + PartialEq> PartialEq for ColumnStack<T> {
+    fn eq(&self, other: &Self) -> bool {
+        PartialEq::eq(&self[..], &other[..])
+    }
+}
+
+impl<T: Columnation + Eq> Eq for ColumnStack<T> {}
+
+impl<T: Columnation + std::fmt::Debug> std::fmt::Debug for ColumnStack<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (&self[..]).fmt(f)
+    }
+}
+
+impl<T: Columnation> Clone for ColumnStack<T> {
+    fn clone(&self) -> Self {
+        let mut new: Self = Default::default();
+        for item in &self[..] {
+            new.copy(item);
+        }
+        new
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.clear();
+        for item in &source[..] {
+            self.copy(item);
+        }
+    }
+}
 
 mod implementations {
 
@@ -423,6 +511,15 @@ mod implementations {
             region1: R1,
         }
 
+        impl<R0: Region, R1: Region> Tuple2Region<R0, R1> {
+            #[inline] pub unsafe fn copy_destructured(&mut self, r0: &R0::Item, r1: &R1::Item) -> <Tuple2Region<R0, R1> as Region>::Item {
+                (
+                    self.region0.copy(&r0),
+                    self.region1.copy(&r1),
+                )
+            }
+        }
+
         impl<R0: Region, R1: Region> Region for Tuple2Region<R0, R1> {
             type Item = (R0::Item, R1::Item);
             #[inline]
@@ -447,6 +544,16 @@ mod implementations {
             region0: R0,
             region1: R1,
             region2: R2,
+        }
+
+        impl<R0: Region, R1: Region, R2: Region> Tuple3Region<R0, R1, R2> {
+            #[inline] pub unsafe fn copy_destructured(&mut self, r0: &R0::Item, r1: &R1::Item, r2: &R2::Item) -> <Tuple3Region<R0, R1, R2> as Region>::Item {
+                (
+                    self.region0.copy(r0),
+                    self.region1.copy(r1),
+                    self.region2.copy(r2),
+                )
+            }
         }
 
         impl<R0: Region, R1: Region, R2: Region> Region for Tuple3Region<R0, R1, R2> {
