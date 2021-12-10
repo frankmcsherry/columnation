@@ -340,6 +340,7 @@ mod implementations {
     }
     implement_columnation!(());
     implement_columnation!(bool);
+    implement_columnation!(char);
 
     implement_columnation!(u8);
     implement_columnation!(u16);
@@ -354,6 +355,18 @@ mod implementations {
     implement_columnation!(i64);
     implement_columnation!(i128);
     implement_columnation!(isize);
+
+    implement_columnation!(f32);
+    implement_columnation!(f64);
+
+    implement_columnation!(std::num::Wrapping<i8>);
+    implement_columnation!(std::num::Wrapping<i16>);
+    implement_columnation!(std::num::Wrapping<i32>);
+    implement_columnation!(std::num::Wrapping<i64>);
+    implement_columnation!(std::num::Wrapping<i128>);
+    implement_columnation!(std::num::Wrapping<isize>);
+
+    implement_columnation!(std::time::Duration);
 
     /// Implementations for `Option<T: Columnation>`.
     pub mod option {
