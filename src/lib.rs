@@ -496,81 +496,85 @@ mod implementations {
         }
     }
 
-    /// Implementation for tuples. Macros seemed hard.
+    /// Implementation for tuples.
     pub mod tuple {
 
         use super::{Columnation, Region};
 
-        impl<T0: Columnation, T1: Columnation> Columnation for (T0, T1) {
-            type InnerRegion = Tuple2Region<T0::InnerRegion, T1::InnerRegion>;
+        use paste::paste;
+
+        /// The macro creates
+        macro_rules! tuple_columnation {
+            ( $($name:ident)+) => ( paste! {
+                impl<$($name: Columnation),*> Columnation for ($($name,)*) {
+                    type InnerRegion = [<Tuple $($name)* Region >]<$($name::InnerRegion,)*>;
+                }
+
+                #[allow(non_snake_case)]
+                #[derive(Default)]
+                pub struct [<Tuple $($name)* Region >]<$($name: Region),*> {
+                    $([<region $name>]: $name),*
+                }
+
+                #[allow(non_snake_case)]
+                impl<$($name: Region),*> [<Tuple $($name)* Region>]<$($name),*> {
+                    #[allow(clippy::too_many_arguments)]
+                    #[inline] pub unsafe fn copy_destructured(&mut self, $([<r $name>]: &$name::Item),*) -> <[<Tuple $($name)* Region>]<$($name),*> as Region>::Item {
+                        (
+                            $(self.[<region $name>].copy(&[<r $name>]),)*
+                        )
+                    }
+                }
+
+                #[allow(non_snake_case)]
+                impl<$($name: Region),*> Region for [<Tuple $($name)* Region>]<$($name),*> {
+                    type Item = ($($name::Item,)*);
+                    #[inline]
+                    fn clear(&mut self) {
+                        $(self.[<region $name>].clear());*
+                    }
+                    #[inline] unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
+                        let ($(ref $name,)*) = *item;
+                        (
+                            $(self.[<region $name>].copy($name),)*
+                        )
+                    }
+                }
+                }
+            );
         }
 
-        #[derive(Default)]
-        pub struct Tuple2Region<R0: Region, R1: Region> {
-            region0: R0,
-            region1: R1,
-        }
-
-        impl<R0: Region, R1: Region> Tuple2Region<R0, R1> {
-            #[inline] pub unsafe fn copy_destructured(&mut self, r0: &R0::Item, r1: &R1::Item) -> <Tuple2Region<R0, R1> as Region>::Item {
-                (
-                    self.region0.copy(&r0),
-                    self.region1.copy(&r1),
-                )
-            }
-        }
-
-        impl<R0: Region, R1: Region> Region for Tuple2Region<R0, R1> {
-            type Item = (R0::Item, R1::Item);
-            #[inline]
-            fn clear(&mut self) {
-                self.region0.clear();
-                self.region1.clear();
-            }
-            #[inline] unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
-                (
-                    self.region0.copy(&item.0),
-                    self.region1.copy(&item.1),
-                )
-            }
-        }
-
-        impl<T0: Columnation, T1: Columnation, T2: Columnation> Columnation for (T0, T1, T2) {
-            type InnerRegion = Tuple3Region<T0::InnerRegion, T1::InnerRegion, T2::InnerRegion>;
-        }
-
-        #[derive(Default)]
-        pub struct Tuple3Region<R0: Region, R1: Region, R2: Region> {
-            region0: R0,
-            region1: R1,
-            region2: R2,
-        }
-
-        impl<R0: Region, R1: Region, R2: Region> Tuple3Region<R0, R1, R2> {
-            #[inline] pub unsafe fn copy_destructured(&mut self, r0: &R0::Item, r1: &R1::Item, r2: &R2::Item) -> <Tuple3Region<R0, R1, R2> as Region>::Item {
-                (
-                    self.region0.copy(r0),
-                    self.region1.copy(r1),
-                    self.region2.copy(r2),
-                )
-            }
-        }
-
-        impl<R0: Region, R1: Region, R2: Region> Region for Tuple3Region<R0, R1, R2> {
-            type Item = (R0::Item, R1::Item, R2::Item);
-            #[inline]
-            fn clear(&mut self) {
-                self.region0.clear();
-                self.region1.clear();
-                self.region2.clear();
-            }
-            #[inline] unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
-                (
-                    self.region0.copy(&item.0),
-                    self.region1.copy(&item.1),
-                    self.region2.copy(&item.2),
-                )
-            }
-        }
+        tuple_columnation!(A);
+        tuple_columnation!(A B);
+        tuple_columnation!(A B C);
+        tuple_columnation!(A B C D);
+        tuple_columnation!(A B C D E);
+        tuple_columnation!(A B C D E F);
+        tuple_columnation!(A B C D E F G);
+        tuple_columnation!(A B C D E F G H);
+        tuple_columnation!(A B C D E F G H I);
+        tuple_columnation!(A B C D E F G H I J);
+        tuple_columnation!(A B C D E F G H I J K);
+        tuple_columnation!(A B C D E F G H I J K L);
+        tuple_columnation!(A B C D E F G H I J K L M);
+        tuple_columnation!(A B C D E F G H I J K L M N);
+        tuple_columnation!(A B C D E F G H I J K L M N O);
+        tuple_columnation!(A B C D E F G H I J K L M N O P);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z AA);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z AA AB);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z AA AB AC);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z AA AB AC AD);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z AA AB AC AD AE);
+        tuple_columnation!(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z AA AB AC AD AE AF);
     }
 }
