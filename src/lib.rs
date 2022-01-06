@@ -225,34 +225,6 @@ impl<T: Columnation> ColumnStack<T> {
     }
 }
 
-impl<A: Columnation, B: Columnation> ColumnStack<(A, B)> {
-    /// Copies a destructured tuple `(A, B)` into this column stack.
-    ///
-    /// This serves situations where a tuple should be constructed from its constituents but not
-    /// not all elements are available as owned data.
-    ///
-    /// The element can be read by indexing
-    pub fn copy_destructured(&mut self, t1: &A, t2: &B) {
-        unsafe {
-            self.local.push(self.inner.copy_destructured(t1, t2));
-        }
-    }
-}
-
-impl<A: Columnation, B: Columnation, C: Columnation> ColumnStack<(A, B, C)> {
-    /// Copies a destructured tuple `(A, B, C)` into this column stack.
-    ///
-    /// This serves situations where a tuple should be constructed from its constituents but not
-    /// not all elements are available as owned data.
-    ///
-    /// The element can be read by indexing
-    pub fn copy_destructured(&mut self, r0: &A, r1: &B, r2: &C) {
-        unsafe {
-            self.local.push(self.inner.copy_destructured(r0, r1, r2));
-        }
-    }
-}
-
 impl<T: Columnation> std::ops::Deref for ColumnStack<T> {
     type Target = [T];
     #[inline(always)]
@@ -326,7 +298,7 @@ impl<T: Columnation> Clone for ColumnStack<T> {
 
 mod implementations {
 
-    use super::{Region, CloneRegion, StableRegion, Columnation};
+    use super::{Region, CloneRegion, StableRegion, Columnation, ColumnStack};
 
     // Implementations for types whose `clone()` suffices for the region.
     macro_rules! implement_columnation {
@@ -510,11 +482,11 @@ mod implementations {
     /// Implementation for tuples.
     pub mod tuple {
 
-        use super::{Columnation, Region};
+        use super::{Columnation, ColumnStack, Region};
 
         use paste::paste;
 
-        /// The macro creates
+        /// The macro creates the region implementation for tuples
         macro_rules! tuple_columnation {
             ( $($name:ident)+) => ( paste! {
                 impl<$($name: Columnation),*> Columnation for ($($name,)*) {
@@ -551,6 +523,33 @@ mod implementations {
                         )
                     }
                 }
+                }
+                tuple_column_stack!(ColumnStack, $($name)*);
+            );
+        }
+
+        /// The macro creates the `copy_destructured` implementation for a custom column stack
+        /// with a single generic parameter characterizing the type `T` it stores.
+        /// It assumes there are two fields on `self`:
+        /// * `local`: A type supporting `push(T)`, e.g, `Vec`.
+        /// * `inner`: A region of type `T`.
+        /// We're exporting this macro so custom `ColumnStack` implementations can benefit from it.
+        #[macro_export]
+        macro_rules! tuple_column_stack {
+            ( $type:ident, $($name:ident)+) => (
+                #[allow(non_snake_case)]
+                impl<$($name: Columnation),*> $type<($($name,)*)> {
+                    /// Copies a destructured tuple into this column stack.
+                    ///
+                    /// This serves situations where a tuple should be constructed from its constituents but not
+                    /// not all elements are available as owned data.
+                    ///
+                    /// The element can be read by indexing
+                    pub fn copy_destructured(&mut self, $($name: &$name,)*) {
+                        unsafe {
+                            self.local.push(self.inner.copy_destructured($($name,)*));
+                        }
+                    }
                 }
             );
         }
