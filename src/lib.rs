@@ -178,8 +178,9 @@ impl<T: Columnation> ColumnStack<T> {
     /// Construct a [ColumnStack], reserving space for `capacity` elements
     ///
     /// Note that the associated region is not initialized to a specific capacity
-    /// because we can't generally know how much space would be required.
-    pub fn with_capacity(capacity: usize) -> Self {
+    /// because we can't generally know how much space would be required. For this reason,
+    /// this function is private.
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             local: Vec::with_capacity(capacity),
             inner: T::InnerRegion::default(),
