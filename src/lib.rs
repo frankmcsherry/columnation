@@ -12,8 +12,6 @@
 //! keyword and Rust's safety is not yet clearly enough specified
 //! for me to make any stronger statements than that.
 
-use std::borrow::Borrow;
-
 /// A type that can absorb owned data from type `T`.
 ///
 /// This type will ensure that absorbed data remain valid as long as the
@@ -278,18 +276,18 @@ impl<T: Columnation> Default for ColumnStack<T> {
     }
 }
 
-impl<T: Columnation, B: Borrow<T>> Extend<B> for ColumnStack<T> {
-    fn extend<I: IntoIterator<Item=B>>(&mut self, iter: I) {
+impl<'a, T: Columnation + 'a> Extend<&'a T> for ColumnStack<T> {
+    fn extend<I: IntoIterator<Item=&'a T>>(&mut self, iter: I) {
         for element in iter {
-            self.copy(element.borrow())
+            self.copy(element)
         }
     }
 }
 
-impl<A: Columnation, B: Borrow<A>> std::iter::FromIterator<B> for ColumnStack<A> {
-    fn from_iter<T: IntoIterator<Item=B>>(iter: T) -> Self {
+impl<'a, T: Columnation + 'a> std::iter::FromIterator<&'a T> for ColumnStack<T> {
+    fn from_iter<I: IntoIterator<Item=&'a T>>(iter: I) -> Self {
         let iter = iter.into_iter();
-        let mut c = ColumnStack::<A>::with_capacity(iter.size_hint().0);
+        let mut c = ColumnStack::<T>::with_capacity(iter.size_hint().0);
         c.extend(iter);
         c
     }
