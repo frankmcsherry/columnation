@@ -40,11 +40,9 @@ pub trait Region : Default {
     fn clear(&mut self);
 
     /// Ensure that the region can absorb `items` without reallocation.
-    #[inline(always)]
     fn with_capacity_for<'a, I>(&'a mut self, _items: I)
     where
-        I: Iterator<Item=&'a Self::Item>+Clone,
-    { }
+        I: Iterator<Item=&'a Self::Item>+Clone;
 }
 
 /// A vacuous region that just clones items.
@@ -67,6 +65,8 @@ impl<T: Clone> Region for CloneRegion<T> {
     }
     #[inline(always)]
     fn clear(&mut self) { }
+
+    fn with_capacity_for<'a, I>(&'a mut self, _items: I) where I: Iterator<Item=&'a Self::Item> + Clone { }
 }
 
 
