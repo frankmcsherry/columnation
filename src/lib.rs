@@ -40,11 +40,9 @@ pub trait Region : Default {
     fn clear(&mut self);
 
     /// Ensure that the region can absorb `items` without reallocation.
-    #[inline(always)]
     fn with_capacity_for<'a, I>(&'a mut self, _items: I)
     where
-        I: Iterator<Item=&'a Self::Item>+Clone,
-    { }
+        I: Iterator<Item=&'a Self::Item>+Clone;
 }
 
 /// A vacuous region that just clones items.
@@ -67,6 +65,8 @@ impl<T: Clone> Region for CloneRegion<T> {
     }
     #[inline(always)]
     fn clear(&mut self) { }
+
+    fn with_capacity_for<'a, I>(&'a mut self, _items: I) where I: Iterator<Item=&'a Self::Item> + Clone { }
 }
 
 
@@ -534,6 +534,17 @@ mod implementations {
 
         use paste::paste;
 
+        macro_rules! tuple_columnation_inner {
+            ([$name0:tt $($name:tt)*], [($index0:tt) $(($index:tt))*], $self:tt, $items:tt) => ( paste! {
+                    $self.[<region $name0>].with_capacity_for($items.clone().map(|item| {
+                        &item.$index0
+                    }));
+                    tuple_columnation_inner!([$($name)*], [$(($index))*], $self, $items);
+                }
+            );
+            ([], [$(($index:tt))*], $self:ident, $items:ident) => ( );
+        }
+
         /// The macro creates the region implementation for tuples
         macro_rules! tuple_columnation {
             ( $($name:ident)+) => ( paste! {
@@ -569,6 +580,13 @@ mod implementations {
                         (
                             $(self.[<region $name>].copy($name),)*
                         )
+                    }
+                    #[inline(always)]
+                    fn with_capacity_for<'a, It>(&'a mut self, items: It)
+                        where
+                            It: Iterator<Item=&'a Self::Item>+Clone,
+                    {
+                        tuple_columnation_inner!([$($name)+], [(0) (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12) (13) (14) (15) (16) (17) (18) (19) (20) (21) (22) (23) (24) (25) (26) (27) (28) (29) (30) (31)], self, items);
                     }
                 }
                 }
