@@ -72,6 +72,13 @@ pub trait Region : Default {
         region.reserve_regions(regions);
         region
     }
+
+    /// Estimate this region's memory capacity in bytes.
+    ///
+    /// The memory capacity is the sum of all allocations reachable from this
+    /// region. If it cannot be determined accurately, an estimate can be
+    /// returned instead.
+    fn size_of(&self) -> usize;
 }
 
 /// A vacuous region that just clones items.
@@ -104,6 +111,10 @@ impl<T: Clone> Region for CloneRegion<T> {
     where
         Self: 'a,
         I: Iterator<Item = &'a Self> + Clone { }
+
+    fn size_of(&self) -> usize {
+        0
+    }
 }
 
 
@@ -209,6 +220,11 @@ impl<T> StableRegion<T> {
     /// The number of items current held in the region.
     pub fn len(&self) -> usize {
         self.local.len() + self.stash.iter().map(|r| r.len()).sum::<usize>()
+    }
+
+    /// Determine the capacity in bytes backing this region.
+    pub fn size_of(&self) -> usize {
+        (self.local.capacity() + self.stash.iter().map(Vec::capacity).sum::<usize>()) * std::mem::size_of::<T>()
     }
 }
 
@@ -323,6 +339,11 @@ mod columnstack {
                     self.local.set_len(write_position);
                 }
             }
+        }
+
+        /// Estimate the memory capacity in bytes.
+        pub fn byte_capacity(&self) -> usize {
+            std::mem::size_of::<Self>() + self.inner.size_of() + self.local.capacity() * std::mem::size_of::<T>()
         }
     }
 
@@ -476,6 +497,9 @@ mod implementations {
             {
                 self.region.reserve_regions(regions.map(|r| &r.region));
             }
+            fn size_of(&self) -> usize {
+                self.region.size_of()
+            }
         }
 
         impl<T: Columnation> Columnation for Option<T> {
@@ -527,6 +551,9 @@ mod implementations {
             {
                 self.region1.reserve_regions(regions.clone().map(|r| &r.region1));
                 self.region2.reserve_regions(regions.map(|r| &r.region2));
+            }
+            fn size_of(&self) -> usize {
+                self.region1.size_of() + self.region2.size_of()
             }
         }
 
@@ -598,6 +625,9 @@ mod implementations {
                 self.region.reserve(regions.clone().map(|r| r.region.len()).sum());
                 self.inner.reserve_regions(regions.map(|r| &r.inner));
             }
+            fn size_of(&self) -> usize {
+                self.inner.size_of() + self.region.size_of()
+            }
         }
     }
 
@@ -646,6 +676,9 @@ mod implementations {
                 I: Iterator<Item = &'a Self> + Clone,
             {
                 self.region.reserve(regions.clone().map(|r| r.region.len()).sum());
+            }
+            fn size_of(&self) -> usize {
+                self.region.size_of()
             }
         }
     }
@@ -732,6 +765,9 @@ mod implementations {
                         It: Iterator<Item = &'a Self> + Clone,
                     {
                         tuple_columnation_inner2!([$($name)+], [(0) (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12) (13) (14) (15) (16) (17) (18) (19) (20) (21) (22) (23) (24) (25) (26) (27) (28) (29) (30) (31)], self, regions);
+                    }
+                    #[inline] fn size_of(&self) -> usize {
+                        0 $(+ self.[<region $name>].size_of())*
                     }
                 }
                 }
