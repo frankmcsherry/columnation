@@ -40,9 +40,38 @@ pub trait Region : Default {
     fn clear(&mut self);
 
     /// Ensure that the region can absorb `items` without reallocation.
-    fn with_capacity_for<'a, I>(&'a mut self, _items: I)
+    fn reserve_items<'a, I>(&mut self, items: I)
     where
+        Self: 'a,
         I: Iterator<Item=&'a Self::Item>+Clone;
+
+    /// Allocate an instance of `Self` that can absorb `items` without reallocation.
+    fn with_capacity_items<'a, I>(items: I) -> Self
+    where
+        Self: 'a,
+        I: Iterator<Item=&'a Self::Item>+Clone
+    {
+        let mut region = Self::default();
+        region.reserve_items(items);
+        region
+    }
+
+    // Ensure that the region can absorb the items of `regions` without reallocation
+    fn reserve_regions<'a, I>(&mut self, regions: I)
+    where
+        Self: 'a,
+        I: Iterator<Item = &'a Self> + Clone;
+
+    /// Allocate an instance of `Self` that can absorb the items of `regions` without reallocation.
+    fn with_capacity_regions<'a, I>(regions: I) -> Self
+    where
+        Self: 'a,
+        I: Iterator<Item = &'a Self> + Clone
+    {
+        let mut region = Self::default();
+        region.reserve_regions(regions);
+        region
+    }
 }
 
 /// A vacuous region that just clones items.
@@ -66,17 +95,25 @@ impl<T: Clone> Region for CloneRegion<T> {
     #[inline(always)]
     fn clear(&mut self) { }
 
-    fn with_capacity_for<'a, I>(&'a mut self, _items: I) where I: Iterator<Item=&'a Self::Item> + Clone { }
+    fn reserve_items<'a, I>(&mut self, _items: I)
+    where
+        Self: 'a,
+        I: Iterator<Item=&'a Self::Item> + Clone { }
+
+    fn reserve_regions<'a, I>(&mut self, _regions: I)
+    where
+        Self: 'a,
+        I: Iterator<Item = &'a Self> + Clone { }
 }
 
 
 /// A region allocator which holds items at stable memory locations.
 ///
-/// Items once inserted will not me moved, and their locations in memory
+/// Items once inserted will not be moved, and their locations in memory
 /// can be relied on by others, until the region is cleared.
 ///
 /// This type accepts owned data, rather than references, and does not
-/// itself intent to implement `Region`. Rather, it is a useful building
+/// itself intend to implement `Region`. Rather, it is a useful building
 /// block for other less-safe code that wants allocated data to remain at
 /// fixed memory locations.
 pub struct StableRegion<T> {
@@ -147,13 +184,25 @@ impl<T> StableRegion<T> {
             self.stash.push(std::mem::replace(&mut self.local, new_local));
         }
     }
+
+    /// Allocates a new `Self` that can accept `count` items without reallocation.
+    pub fn with_capacity(count: usize) -> Self {
+        let mut region = Self::default();
+        region.reserve(count);
+        region
+    }
+
+    /// The number of items current held in the region.
+    pub fn len(&self) -> usize {
+        self.local.len() + self.stash.iter().map(|r| r.len()).sum::<usize>()
+    }
 }
 
 
 /// A type that can be stored in a columnar region.
 ///
 /// This trait exists only to allow types to name the columnar region
-/// that should be used
+/// that should be used.
 pub trait Columnation: Sized {
     /// The type of region capable of absorbing allocations owned by
     /// the `Self` type. Note: not allocations of `Self`, but of the
@@ -161,154 +210,176 @@ pub trait Columnation: Sized {
     type InnerRegion: Region<Item = Self>;
 }
 
+pub use columnstack::ColumnStack;
 
-/// An append-only vector that store records as columns.
-///
-/// This container maintains elements that might conventionally own
-/// memory allocations, but instead the pointers to those allocations
-/// reference larger regions of memory shared with multiple instances
-/// of the type. Elements can be retrieved as references, and care is
-/// taken when this type is dropped to ensure that the correct memory
-/// is returned (rather than the incorrect memory, from running the
-/// elements `Drop` implementations).
-pub struct ColumnStack<T: Columnation> {
-    local: Vec<T>,
-    inner: T::InnerRegion,
-}
+mod columnstack {
 
-impl<T: Columnation> ColumnStack<T> {
-    /// Construct a [ColumnStack], reserving space for `capacity` elements
+    use super::{Columnation, Region};
+
+    /// An append-only vector that store records as columns.
     ///
-    /// Note that the associated region is not initialized to a specific capacity
-    /// because we can't generally know how much space would be required. For this reason,
-    /// this function is private.
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            local: Vec::with_capacity(capacity),
-            inner: T::InnerRegion::default(),
-        }
+    /// This container maintains elements that might conventionally own
+    /// memory allocations, but instead the pointers to those allocations
+    /// reference larger regions of memory shared with multiple instances
+    /// of the type. Elements can be retrieved as references, and care is
+    /// taken when this type is dropped to ensure that the correct memory
+    /// is returned (rather than the incorrect memory, from running the
+    /// elements' `Drop` implementations).
+    pub struct ColumnStack<T: Columnation> {
+        pub(crate) local: Vec<T>,
+        pub(crate) inner: T::InnerRegion,
     }
 
-    /// Ensures `Self` can absorb `items` without further allocations.
-    ///
-    /// The argument `items` will be cloned and iterated multiple times.
-    /// Please be careful if it contains side effects.
-    #[inline(always)]
-    pub fn with_capacity_for<'a, I>(&'a mut self, items: I)
-    where
-        I: Iterator<Item= &'a T>+Clone,
-    {
-        self.local.reserve(items.clone().count());
-        self.inner.with_capacity_for(items);
-    }
-
-
-    /// Copies an element in to the region.
-    ///
-    /// The element can be read by indexing
-    pub fn copy(&mut self, item: &T) {
-        // TODO: Some types `T` should just be cloned.
-        // E.g. types that are `Copy` or vecs of ZSTs.
-        unsafe {
-            self.local.push(self.inner.copy(item));
-        }
-    }
-    /// Empties the collection.
-    pub fn clear(&mut self) {
-        unsafe {
-            // Unsafety justified in that setting the length to zero exposes
-            // no invalid data.
-            self.local.set_len(0);
-            self.inner.clear();
-        }
-    }
-    /// Retain elements that pass a predicate, from a specified offset.
-    ///
-    /// This method may or may not reclaim memory in the inner region.
-    pub fn retain_from<P: FnMut(&T)->bool>(&mut self, index: usize, mut predicate: P) {
-        let mut write_position = index;
-        for position in index .. self.local.len() {
-            if predicate(&self[position]) {
-                // TODO: compact the inner region and update pointers.
-                self.local.swap(position, write_position);
-                write_position += 1;
+    impl<T: Columnation> ColumnStack<T> {
+        /// Construct a [ColumnStack], reserving space for `capacity` elements
+        ///
+        /// Note that the associated region is not initialized to a specific capacity
+        /// because we can't generally know how much space would be required. For this reason,
+        /// this function is private.
+        fn with_capacity(capacity: usize) -> Self {
+            Self {
+                local: Vec::with_capacity(capacity),
+                inner: T::InnerRegion::default(),
             }
         }
-        unsafe {
-            // Unsafety justified in that `write_position` is no greater than
-            // `self.local.len()` and so this exposes no invalid data.
-            self.local.set_len(write_position);
+
+        /// Ensures `Self` can absorb `items` without further allocations.
+        ///
+        /// The argument `items` may be cloned and iterated multiple times.
+        /// Please be careful if it contains side effects.
+        #[inline(always)]
+        pub fn reserve_items<'a, I>(&'a mut self, items: I)
+        where
+            I: Iterator<Item= &'a T>+Clone,
+        {
+            self.local.reserve(items.clone().count());
+            self.inner.reserve_items(items);
+        }
+
+        /// Ensures `Self` can absorb `items` without further allocations.
+        ///
+        /// The argument `items` may be cloned and iterated multiple times.
+        /// Please be careful if it contains side effects.
+        #[inline(always)]
+        pub fn reserve_regions<'a, I>(&mut self, regions: I)
+        where
+            Self: 'a,
+            I: Iterator<Item= &'a Self>+Clone,
+        {
+            self.local.reserve(regions.clone().map(|cs| cs.local.len()).sum());
+            self.inner.reserve_regions(regions.map(|cs| &cs.inner));
+        }
+
+
+        /// Copies an element in to the region.
+        ///
+        /// The element can be read by indexing
+        pub fn copy(&mut self, item: &T) {
+            // TODO: Some types `T` should just be cloned.
+            // E.g. types that are `Copy` or vecs of ZSTs.
+            unsafe {
+                self.local.push(self.inner.copy(item));
+            }
+        }
+        /// Empties the collection.
+        pub fn clear(&mut self) {
+            unsafe {
+                // Unsafety justified in that setting the length to zero exposes
+                // no invalid data.
+                self.local.set_len(0);
+                self.inner.clear();
+            }
+        }
+        /// Retain elements that pass a predicate, from a specified offset.
+        ///
+        /// This method may or may not reclaim memory in the inner region.
+        pub fn retain_from<P: FnMut(&T)->bool>(&mut self, index: usize, mut predicate: P) {
+            if index < self.local.len() {
+                let mut write_position = index;
+                for position in index .. self.local.len() {
+                    if predicate(&self[position]) {
+                        // TODO: compact the inner region and update pointers.
+                        self.local.swap(position, write_position);
+                        write_position += 1;
+                    }
+                }
+                unsafe {
+                    // Unsafety justified in that `write_position` is no greater than
+                    // `self.local.len()` and so this exposes no invalid data.
+                    self.local.set_len(write_position);
+                }
+            }
         }
     }
-}
 
-impl<T: Columnation> std::ops::Deref for ColumnStack<T> {
-    type Target = [T];
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        &self.local[..]
-    }
-}
-
-impl<T: Columnation> Drop for ColumnStack<T> {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-impl<T: Columnation> Default for ColumnStack<T> {
-    fn default() -> Self {
-        Self {
-            local: Vec::new(),
-            inner: T::InnerRegion::default(),
+    impl<T: Columnation> std::ops::Deref for ColumnStack<T> {
+        type Target = [T];
+        #[inline(always)]
+        fn deref(&self) -> &Self::Target {
+            &self.local[..]
         }
     }
-}
 
-impl<'a, T: Columnation + 'a> Extend<&'a T> for ColumnStack<T> {
-    fn extend<I: IntoIterator<Item=&'a T>>(&mut self, iter: I) {
-        for element in iter {
-            self.copy(element)
+    impl<T: Columnation> Drop for ColumnStack<T> {
+        fn drop(&mut self) {
+            self.clear();
         }
     }
-}
 
-impl<'a, T: Columnation + 'a> std::iter::FromIterator<&'a T> for ColumnStack<T> {
-    fn from_iter<I: IntoIterator<Item=&'a T>>(iter: I) -> Self {
-        let iter = iter.into_iter();
-        let mut c = ColumnStack::<T>::with_capacity(iter.size_hint().0);
-        c.extend(iter);
-        c
-    }
-}
-
-impl<T: Columnation + PartialEq> PartialEq for ColumnStack<T> {
-    fn eq(&self, other: &Self) -> bool {
-        PartialEq::eq(&self[..], &other[..])
-    }
-}
-
-impl<T: Columnation + Eq> Eq for ColumnStack<T> {}
-
-impl<T: Columnation + std::fmt::Debug> std::fmt::Debug for ColumnStack<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        (&self[..]).fmt(f)
-    }
-}
-
-impl<T: Columnation> Clone for ColumnStack<T> {
-    fn clone(&self) -> Self {
-        let mut new: Self = Default::default();
-        for item in &self[..] {
-            new.copy(item);
+    impl<T: Columnation> Default for ColumnStack<T> {
+        fn default() -> Self {
+            Self {
+                local: Vec::new(),
+                inner: T::InnerRegion::default(),
+            }
         }
-        new
     }
 
-    fn clone_from(&mut self, source: &Self) {
-        self.clear();
-        for item in &source[..] {
-            self.copy(item);
+    impl<'a, T: Columnation + 'a> Extend<&'a T> for ColumnStack<T> {
+        fn extend<I: IntoIterator<Item=&'a T>>(&mut self, iter: I) {
+            for element in iter {
+                self.copy(element)
+            }
+        }
+    }
+
+    impl<'a, T: Columnation + 'a> std::iter::FromIterator<&'a T> for ColumnStack<T> {
+        fn from_iter<I: IntoIterator<Item=&'a T>>(iter: I) -> Self {
+            let iter = iter.into_iter();
+            let mut c = ColumnStack::<T>::with_capacity(iter.size_hint().0);
+            c.extend(iter);
+            c
+        }
+    }
+
+    impl<T: Columnation + PartialEq> PartialEq for ColumnStack<T> {
+        fn eq(&self, other: &Self) -> bool {
+            PartialEq::eq(&self[..], &other[..])
+        }
+    }
+
+    impl<T: Columnation + Eq> Eq for ColumnStack<T> {}
+
+    impl<T: Columnation + std::fmt::Debug> std::fmt::Debug for ColumnStack<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            (&self[..]).fmt(f)
+        }
+    }
+
+    impl<T: Columnation> Clone for ColumnStack<T> {
+        fn clone(&self) -> Self {
+            let mut new: Self = Default::default();
+            for item in &self[..] {
+                new.copy(item);
+            }
+            new
+        }
+
+        fn clone_from(&mut self, source: &Self) {
+            self.clear();
+            for item in &source[..] {
+                self.copy(item);
+            }
         }
     }
 }
@@ -376,11 +447,20 @@ mod implementations {
                 self.region.clear();
             }
             #[inline(always)]
-            fn with_capacity_for<'a, I>(&'a mut self, items: I)
+            fn reserve_items<'a, I>(&mut self, items: I)
             where
+                Self: 'a,
                 I: Iterator<Item=&'a Self::Item>+Clone,
             {
-                self.region.with_capacity_for(items.flat_map(|x| x.as_ref()));
+                self.region.reserve_items(items.flat_map(|x| x.as_ref()));
+            }
+
+            fn reserve_regions<'a, I>(&mut self, regions: I)
+            where
+                Self: 'a,
+                I: Iterator<Item = &'a Self> + Clone,
+            {
+                self.region.reserve_regions(regions.map(|r| &r.region));
             }
         }
 
@@ -416,13 +496,23 @@ mod implementations {
                 self.region2.clear();
             }
             #[inline]
-            fn with_capacity_for<'a, I>(&'a mut self, items: I)
+            fn reserve_items<'a, I>(&mut self, items: I)
             where
+                Self: 'a,
                 I: Iterator<Item=&'a Self::Item>+Clone,
             {
                 let items2 = items.clone();
-                self.region1.with_capacity_for(items2.flat_map(|x| x.as_ref().ok()));
-                self.region2.with_capacity_for(items.flat_map(|x| x.as_ref().err()));
+                self.region1.reserve_items(items2.flat_map(|x| x.as_ref().ok()));
+                self.region2.reserve_items(items.flat_map(|x| x.as_ref().err()));
+            }
+
+            fn reserve_regions<'a, I>(&mut self, regions: I)
+            where
+                Self: 'a,
+                I: Iterator<Item = &'a Self> + Clone,
+            {
+                self.region1.reserve_regions(regions.clone().map(|r| &r.region1));
+                self.region2.reserve_regions(regions.map(|r| &r.region2));
             }
         }
 
@@ -477,12 +567,22 @@ mod implementations {
                 Vec::from_raw_parts(slice.as_mut_ptr(), item.len(), item.len())
             }
             #[inline(always)]
-            fn with_capacity_for<'a, I>(&'a mut self, items: I)
+            fn reserve_items<'a, I>(&mut self, items: I)
             where
+                Self: 'a,
                 I: Iterator<Item=&'a Self::Item>+Clone,
             {
                 self.region.reserve(items.clone().count());
-                self.inner.with_capacity_for(items.flat_map(|x| x.iter()));
+                self.inner.reserve_items(items.flat_map(|x| x.iter()));
+            }
+
+            fn reserve_regions<'a, I>(&mut self, regions: I)
+            where
+                Self: 'a,
+                I: Iterator<Item = &'a Self> + Clone,
+            {
+                self.region.reserve(regions.clone().map(|r| r.region.len()).sum());
+                self.inner.reserve_regions(regions.map(|r| &r.inner));
             }
         }
     }
@@ -518,11 +618,20 @@ mod implementations {
                 String::from_raw_parts(bytes.as_mut_ptr(), item.len(), item.len())
             }
             #[inline(always)]
-            fn with_capacity_for<'a, I>(&'a mut self, items: I)
+            fn reserve_items<'a, I>(&mut self, items: I)
             where
+                Self: 'a,
                 I: Iterator<Item=&'a Self::Item>+Clone,
             {
                 self.region.reserve(items.map(|x| x.len()).sum());
+            }
+
+            fn reserve_regions<'a, I>(&mut self, regions: I)
+            where
+                Self: 'a,
+                I: Iterator<Item = &'a Self> + Clone,
+            {
+                self.region.reserve(regions.clone().map(|r| r.region.len()).sum());
             }
         }
     }
@@ -534,15 +643,27 @@ mod implementations {
 
         use paste::paste;
 
-        macro_rules! tuple_columnation_inner {
+        macro_rules! tuple_columnation_inner1 {
             ([$name0:tt $($name:tt)*], [($index0:tt) $(($index:tt))*], $self:tt, $items:tt) => ( paste! {
-                    $self.[<region $name0>].with_capacity_for($items.clone().map(|item| {
+                    $self.[<region $name0>].reserve_items($items.clone().map(|item| {
                         &item.$index0
                     }));
-                    tuple_columnation_inner!([$($name)*], [$(($index))*], $self, $items);
+                    tuple_columnation_inner1!([$($name)*], [$(($index))*], $self, $items);
                 }
             );
             ([], [$(($index:tt))*], $self:ident, $items:ident) => ( );
+        }
+
+        // This macro is copied from the above macro, but could probably be simpler as it does not need indexes.
+        macro_rules! tuple_columnation_inner2 {
+            ([$name0:tt $($name:tt)*], [($index0:tt) $(($index:tt))*], $self:tt, $regions:tt) => ( paste! {
+                    $self.[<region $name0>].reserve_regions($regions.clone().map(|region| {
+                        &region.[<region $name0>]
+                    }));
+                    tuple_columnation_inner2!([$($name)*], [$(($index))*], $self, $regions);
+                }
+            );
+            ([], [$(($index:tt))*], $self:ident, $regions:ident) => ( );
         }
 
         /// The macro creates the region implementation for tuples
@@ -582,11 +703,21 @@ mod implementations {
                         )
                     }
                     #[inline(always)]
-                    fn with_capacity_for<'a, It>(&'a mut self, items: It)
-                        where
-                            It: Iterator<Item=&'a Self::Item>+Clone,
+                    fn reserve_items<'a, It>(&mut self, items: It)
+                    where
+                        Self: 'a,
+                        It: Iterator<Item=&'a Self::Item>+Clone,
                     {
-                        tuple_columnation_inner!([$($name)+], [(0) (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12) (13) (14) (15) (16) (17) (18) (19) (20) (21) (22) (23) (24) (25) (26) (27) (28) (29) (30) (31)], self, items);
+                        tuple_columnation_inner1!([$($name)+], [(0) (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12) (13) (14) (15) (16) (17) (18) (19) (20) (21) (22) (23) (24) (25) (26) (27) (28) (29) (30) (31)], self, items);
+                    }
+
+                    #[inline(always)]
+                    fn reserve_regions<'a, It>(&mut self, regions: It)
+                    where
+                        Self: 'a,
+                        It: Iterator<Item = &'a Self> + Clone,
+                    {
+                        tuple_columnation_inner2!([$($name)+], [(0) (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12) (13) (14) (15) (16) (17) (18) (19) (20) (21) (22) (23) (24) (25) (26) (27) (28) (29) (30) (31)], self, regions);
                     }
                 }
                 }
