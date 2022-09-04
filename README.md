@@ -59,7 +59,7 @@ test vec_u_vn_s_copy  ... bench:   8,580,739 ns/iter (+/- 451,180)
 ```
 In each case, other than the intentionally trivial `empty` case, the `_copy` version is markedly faster than the `_clone` version. This makes some sense, as we are able to re-use all of the allocations across runs in the `_copy` case and only the vector's spine in the `_clone` case (we could attempt more complicated buffer pooling, but we haven't done that here).
 
-The `empty` case has an interesting story. When consolidating the multiple `Vec<()>` allocations into one `Vec<()>`, we introduce the cost of maitnaining the length and capacity of that vector. It should be "unbounded" with a zero-sized type, but in fact we need to verify that it does not reach `usize::MAX`. The `empty_clone` case does not need to do this, and optimizes to a `memcpy`, whereas the `empty_copy` case must check the capacity between each insertion.
+The `empty` case has an interesting story. When consolidating the multiple `Vec<()>` allocations into one `Vec<()>`, we introduce the cost of maintaining the length and capacity of that vector. It should be "unbounded" with a zero-sized type, but in fact we need to verify that it does not reach `usize::MAX`. The `empty_clone` case does not need to do this, and optimizes to a `memcpy`, whereas the `empty_copy` case must check the capacity between each insertion.
 
 ## Description
 
