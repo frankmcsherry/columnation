@@ -122,6 +122,153 @@ impl<T: Copy> Region for CopyRegion<T> {
     }
 }
 
+mod memory {
+
+    /// An abstraction over different kinds of allocated regions.
+    pub(crate) enum Region<T> {
+        /// An empty region, not backed by anything.
+        Nil,
+        /// A heap-allocated region, represented as a vector.
+        Heap(Vec<T>),
+        /// A mmaped region, represented by a vector and its backing memory mapping.
+        MMap(Vec<T>, memmap2::MmapRaw),
+    }
+
+    impl<T> Default for Region<T> {
+        fn default() -> Self {
+            Self::new_nil()
+        }
+    }
+
+    impl<T> Region<T> {
+        /// Create a new empty region.
+        pub(crate) fn new_nil() -> Region<T> {
+            Region::Nil
+        }
+
+        /// Create a new heap-allocated region of a specific capacity.
+        pub(crate) fn new_heap(capacity: usize) -> Region<T> {
+            Region::Heap(Vec::with_capacity(capacity))
+        }
+
+        /// Create a new file-based mapped region of a specific capacity. The capacity of the
+        /// returned region can be larger than requested to accommodate page sizes.
+        pub(crate) fn new_mmap(capacity: usize) -> Region<T> {
+            let capacity = std::cmp::max(capacity, 1<<12 / std::mem::size_of::<T>());
+            let file = tempfile::tempfile().unwrap();
+            let byte_len = std::mem::size_of::<T>() * capacity;
+            let (mmap, new_local) = unsafe {
+                use std::os::unix::io::AsFd;
+                libc::fallocate(std::mem::transmute::<_, i32>(file.as_fd()), 0, 0, byte_len as i64);
+                let mmap = memmap2::MmapRaw::map_raw(&file).unwrap();
+                let new_local = Vec::from_raw_parts(mmap.as_mut_ptr() as *mut T, 0, capacity);
+                (mmap, new_local)
+            };
+            Region::MMap(new_local, mmap)
+        }
+
+        /// Create a region depending on the capacity.
+        ///
+        /// The capacity of the returned region must be at least as large as the requested capacity,
+        /// but can be larger if the implementation requires it.
+        ///
+        /// Crates a [Region::Nil] for empty capacities, a [Region::Heap] for allocations up to 2
+        /// Mib, and [Region::MMap] for larger capacities.
+        pub(crate) fn new_auto(capacity: usize) -> Region<T> {
+            match capacity {
+                0 => Region::new_nil(),
+                capacity @ 1.. if std::mem::size_of::<T>() * capacity <= 2 << 20 => {
+                    Region::new_heap(capacity)
+                },
+                capacity => Region::new_mmap(capacity),
+            }
+        }
+
+        /// Clears the contents of the region, without dropping its elements.
+        pub(crate) unsafe fn clear(&mut self) {
+            match self {
+                Region::Nil => {},
+                Region::Heap(vec) | Region::MMap(vec, _) => vec.set_len(0),
+            }
+        }
+
+        /// Returns the capacity of the underlying allocation.
+        pub(crate) fn capacity(&self) -> usize {
+            match self {
+                Region::Nil => 0,
+                Region::Heap(vec) | Region::MMap(vec, _) => vec.capacity(),
+            }
+        }
+
+        /// Returns the number of elements in the allocation.
+        pub(crate) fn len(&self) -> usize {
+            match self {
+                Region::Nil => 0,
+                Region::Heap(vec) | Region::MMap(vec, _) => vec.len(),
+            }
+        }
+
+        /// Obtain a mutable vector of the allocation. Panics for [Region::Nil].
+        fn as_mut(&mut self) -> &mut Vec<T> {
+            match self {
+                Region::Nil => panic!("Cannot represent Nil region as vector"),
+                Region::Heap(vec) | Region::MMap(vec, _) => vec,
+            }
+        }
+
+        /// Obtain a vector of the allocation. Panics for [Region::Nil].
+        fn as_vec(&self) -> &Vec<T> {
+            match self {
+                Region::Nil => panic!("Cannot represent Nil region as vector"),
+                Region::Heap(vec) | Region::MMap(vec, _) => vec,
+            }
+        }
+    }
+
+    impl<T: Clone> Region<T> {
+        pub(crate) fn extend_from_slice(&mut self, slice: &[T]) {
+            self.as_mut().extend_from_slice(slice);
+        }
+    }
+
+    impl<T> Drop for Region<T> {
+        fn drop(&mut self) {
+            match self {
+                Region::Nil => {}
+                Region::Heap(vec) => {
+                    // Unsafe reasoning: Don't drop the elements.
+                    unsafe { vec.set_len(0) }
+                },
+                Region::MMap(vec, _mmap) => {
+                    // Forget reasoning: The vector points to the mapped region, which frees the
+                    // allocation
+                    std::mem::forget(std::mem::take(vec));
+                }
+            }
+        }
+    }
+
+    impl<T> Extend<T> for Region<T> {
+        #[inline]
+        fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+            self.as_mut().extend(iter);
+        }
+    }
+
+    impl<T> std::ops::Deref for Region<T> {
+        type Target = [T];
+
+        fn deref(&self) -> &Self::Target {
+            self.as_vec()
+        }
+    }
+
+    impl<T> std::ops::DerefMut for Region<T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.as_mut()
+        }
+    }
+}
 
 /// A region allocator which holds items at stable memory locations.
 ///
@@ -134,9 +281,9 @@ impl<T: Copy> Region for CopyRegion<T> {
 /// fixed memory locations.
 pub struct StableRegion<T> {
     /// The active allocation into which we are writing.
-    local: Vec<T>,
+    local: memory::Region<T>,
     /// All previously active allocations.
-    stash: Vec<Vec<T>>,
+    stash: Vec<memory::Region<T>>,
     /// The maximum allocation size
     limit: usize,
 }
@@ -145,7 +292,7 @@ pub struct StableRegion<T> {
 impl<T> Default for StableRegion<T> {
     fn default() -> Self {
         Self {
-            local: Vec::new(),
+            local: memory::Region::Nil,
             stash: Vec::new(),
             limit: usize::MAX,
         }
@@ -168,11 +315,9 @@ impl<T> StableRegion<T> {
         unsafe {
             // Unsafety justified in that setting the length to zero exposes
             // no invalid data.
-            self.local.set_len(0);
+            self.local.clear();
             // Release allocations in `stash` without dropping their elements.
-            for mut buffer in self.stash.drain(..) {
-                buffer.set_len(0);
-            }
+            self.stash.clear();
         }
     }
     /// Copies an iterator of items into the region.
@@ -210,7 +355,7 @@ impl<T> StableRegion<T> {
             let mut next_len = (self.local.capacity() + 1).next_power_of_two();
             next_len = std::cmp::min(next_len, self.limit);
             next_len = std::cmp::max(count, next_len);
-            let new_local = Vec::with_capacity(next_len);
+            let new_local = memory::Region::new_auto(next_len);
             if self.local.is_empty() {
                 self.local = new_local;
             } else {
