@@ -121,6 +121,8 @@ pub struct StableRegion<T> {
     local: Vec<T>,
     /// All previously active allocations.
     stash: Vec<Vec<T>>,
+    /// The maximum allocation size
+    limit: usize,
 }
 
 // Manually implement `Default` as `T` may not implement it.
@@ -129,11 +131,21 @@ impl<T> Default for StableRegion<T> {
         Self {
             local: Vec::new(),
             stash: Vec::new(),
+            limit: usize::MAX,
         }
     }
 }
 
 impl<T> StableRegion<T> {
+    /// Construct a [StableRegion] with a allocation size limit.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            local: Default::default(),
+            stash: Default::default(),
+            limit: limit,
+        }
+    }
+
     /// Clears the contents without dropping any elements.
     #[inline]
     pub fn clear(&mut self) {
@@ -179,8 +191,10 @@ impl<T> StableRegion<T> {
             // Increase allocated capacity in powers of two.
             // We could choose a different rule here if we wanted to be
             // more conservative with memory (e.g. page size allocations).
-            let next_len = (self.local.capacity() + 1).next_power_of_two();
-            let new_local = Vec::with_capacity(std::cmp::max(count, next_len));
+            let mut next_len = (self.local.capacity() + 1).next_power_of_two();
+            next_len = std::cmp::min(next_len, self.limit);
+            next_len = std::cmp::max(count, next_len);
+            let new_local = Vec::with_capacity(next_len);
             self.stash.push(std::mem::replace(&mut self.local, new_local));
         }
     }
