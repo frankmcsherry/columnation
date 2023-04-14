@@ -72,6 +72,17 @@ pub trait Region : Default {
         region.reserve_regions(regions);
         region
     }
+
+    /// Determine this region's memory used and reserved capacity in bytes.
+    ///
+    /// An implementation should invoke the `callback` for each distinct allocation, providing the
+    /// used capacity as the first parameter and the actual capacity as the second parameter.
+    /// Both parameters represent a number of bytes. The implementation should only mention
+    /// allocations it owns, but not itself, because another object owns it.
+    ///
+    /// The closure is free to sum the parameters, or do more advanced analysis such as creating a
+    /// histogram of allocation sizes.
+    fn heap_size(&self, callback: impl FnMut(usize, usize));
 }
 
 /// A vacuous region that just clones items.
@@ -104,6 +115,11 @@ impl<T: Clone> Region for CloneRegion<T> {
     where
         Self: 'a,
         I: Iterator<Item = &'a Self> + Clone { }
+
+    #[inline]
+    fn heap_size(&self, _callback: impl FnMut(usize, usize)) {
+        // Does not contain any allocation
+    }
 }
 
 
@@ -195,7 +211,11 @@ impl<T> StableRegion<T> {
             next_len = std::cmp::min(next_len, self.limit);
             next_len = std::cmp::max(count, next_len);
             let new_local = Vec::with_capacity(next_len);
-            self.stash.push(std::mem::replace(&mut self.local, new_local));
+            if self.local.is_empty() {
+                self.local = new_local;
+            } else {
+                self.stash.push(std::mem::replace(&mut self.local, new_local));
+            }
         }
     }
 
@@ -209,6 +229,23 @@ impl<T> StableRegion<T> {
     /// The number of items current held in the region.
     pub fn len(&self) -> usize {
         self.local.len() + self.stash.iter().map(|r| r.len()).sum::<usize>()
+    }
+
+    #[inline]
+    pub fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
+        // Calculate heap size for local, stash, and stash entries
+        let size_of_t = std::mem::size_of::<T>();
+        callback(
+            self.local.len() * size_of_t,
+            self.local.capacity() * size_of_t,
+        );
+        callback(
+            self.stash.len() * std::mem::size_of::<Vec<T>>(),
+            self.stash.capacity() * std::mem::size_of::<Vec<T>>(),
+        );
+        for stash in &self.stash {
+            callback(stash.len() * size_of_t, stash.capacity() * size_of_t);
+        }
     }
 }
 
@@ -323,6 +360,25 @@ mod columnstack {
                     self.local.set_len(write_position);
                 }
             }
+        }
+
+        /// Estimate the memory capacity in bytes.
+        #[inline]
+        pub fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
+            let size_of = std::mem::size_of::<T>();
+            callback(self.local.len() * size_of, self.local.capacity() * size_of);
+            self.inner.heap_size(callback);
+        }
+
+        /// Estimate the consumed memory capacity in bytes, summing both used and total capacity.
+        #[inline]
+        pub fn summed_heap_size(&self) -> (usize, usize) {
+            let (mut length, mut capacity) = (0, 0);
+            self.heap_size(|len, cap| {
+                length += len;
+                capacity += cap
+            });
+            (length, capacity)
         }
     }
 
@@ -476,6 +532,10 @@ mod implementations {
             {
                 self.region.reserve_regions(regions.map(|r| &r.region));
             }
+            #[inline]
+            fn heap_size(&self, callback: impl FnMut(usize, usize)) {
+                self.region.heap_size(callback)
+            }
         }
 
         impl<T: Columnation> Columnation for Option<T> {
@@ -527,6 +587,11 @@ mod implementations {
             {
                 self.region1.reserve_regions(regions.clone().map(|r| &r.region1));
                 self.region2.reserve_regions(regions.map(|r| &r.region2));
+            }
+            #[inline]
+            fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
+                self.region1.heap_size(&mut callback);
+                self.region2.heap_size(callback)
             }
         }
 
@@ -598,6 +663,11 @@ mod implementations {
                 self.region.reserve(regions.clone().map(|r| r.region.len()).sum());
                 self.inner.reserve_regions(regions.map(|r| &r.inner));
             }
+            #[inline]
+            fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
+                self.inner.heap_size(&mut callback);
+                self.region.heap_size(callback);
+            }
         }
     }
 
@@ -646,6 +716,10 @@ mod implementations {
                 I: Iterator<Item = &'a Self> + Clone,
             {
                 self.region.reserve(regions.clone().map(|r| r.region.len()).sum());
+            }
+            #[inline]
+            fn heap_size(&self, callback: impl FnMut(usize, usize)) {
+                self.region.heap_size(callback)
             }
         }
     }
@@ -732,6 +806,9 @@ mod implementations {
                         It: Iterator<Item = &'a Self> + Clone,
                     {
                         tuple_columnation_inner2!([$($name)+], [(0) (1) (2) (3) (4) (5) (6) (7) (8) (9) (10) (11) (12) (13) (14) (15) (16) (17) (18) (19) (20) (21) (22) (23) (24) (25) (26) (27) (28) (29) (30) (31)], self, regions);
+                    }
+                    #[inline] fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
+                        $(self.[<region $name>].heap_size(&mut callback);)*
                     }
                 }
                 }

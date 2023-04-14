@@ -83,7 +83,7 @@ fn _bench_prealloc<T: Columnation+Eq>(bencher: &mut Bencher, record: T) {
     bencher.iter(|| {
         // prepare encoded data for bencher.bytes
         let mut arena = ColumnStack::<T>::default();
-        arena.with_capacity_for(std::iter::repeat(&record).take(1024));
+        arena.reserve_items(std::iter::repeat(&record).take(1024));
         for _ in 0 .. 1024 {
             arena.copy(&record);
         }
