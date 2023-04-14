@@ -77,7 +77,9 @@ pub trait Region : Default {
     ///
     /// An implementation should invoke the `callback` for each distinct allocation, providing the
     /// used capacity as the first parameter and the actual capacity as the second parameter.
-    /// Both parameters represent a number of bytes.
+    /// Both parameters represent a number of bytes. The implementation should only mention
+    /// allocations it owns, but not itself, because another object owns it.
+    ///
     /// The closure is free to sum the parameters, or do more advanced analysis such as creating a
     /// histogram of allocation sizes.
     fn heap_size(&self, callback: impl FnMut(usize, usize));
@@ -115,7 +117,9 @@ impl<T: Clone> Region for CloneRegion<T> {
         I: Iterator<Item = &'a Self> + Clone { }
 
     #[inline]
-    fn heap_size(&self, _callback: impl FnMut(usize, usize)) { }
+    fn heap_size(&self, _callback: impl FnMut(usize, usize)) {
+        // Does not contain any allocation
+    }
 }
 
 
@@ -227,12 +231,9 @@ impl<T> StableRegion<T> {
         self.local.len() + self.stash.iter().map(|r| r.len()).sum::<usize>()
     }
 
-    /// Determine the used and total capacity in bytes backing this region.
-    ///
-    /// Invokes `callback` for each individual heap allocation, passing the used capacity (length)
-    /// and the actual capacity, which corresponds to the reserved space on the heap.
     #[inline]
     pub fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
+        // Calculate heap size for local, stash, and stash entries
         let size_of_t = std::mem::size_of::<T>();
         callback(
             self.local.len() * size_of_t,
