@@ -235,14 +235,18 @@ impl<T> StableRegion<T> {
     pub fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
         // Calculate heap size for local, stash, and stash entries
         let size_of_t = std::mem::size_of::<T>();
-        callback(
-            self.local.len() * size_of_t,
-            self.local.capacity() * size_of_t,
-        );
-        callback(
-            self.stash.len() * std::mem::size_of::<Vec<T>>(),
-            self.stash.capacity() * std::mem::size_of::<Vec<T>>(),
-        );
+        if self.local.capacity() > 0 {
+            callback(
+                self.local.len() * size_of_t,
+                self.local.capacity() * size_of_t,
+            );
+        }
+        if self.stash.capacity() > 0 {
+            callback(
+                self.stash.len() * std::mem::size_of::<Vec<T>>(),
+                self.stash.capacity() * std::mem::size_of::<Vec<T>>(),
+            );
+        }
         for stash in &self.stash {
             callback(stash.len() * size_of_t, stash.capacity() * size_of_t);
         }
@@ -366,7 +370,9 @@ mod columnstack {
         #[inline]
         pub fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
             let size_of = std::mem::size_of::<T>();
-            callback(self.local.len() * size_of, self.local.capacity() * size_of);
+            if self.local.capacity() > 0 {
+                callback(self.local.len() * size_of, self.local.capacity() * size_of);
+            }
             self.inner.heap_size(callback);
         }
 
