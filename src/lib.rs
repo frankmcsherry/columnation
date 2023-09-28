@@ -85,23 +85,23 @@ pub trait Region : Default {
     fn heap_size(&self, callback: impl FnMut(usize, usize));
 }
 
-/// A vacuous region that just clones items.
-pub struct CloneRegion<T> {
+/// A vacuous region that just copies items.
+pub struct CopyRegion<T> {
     phantom: std::marker::PhantomData<T>,
 }
 
-impl<T> Default for CloneRegion<T> {
+impl<T> Default for CopyRegion<T> {
     fn default() -> Self {
         Self { phantom: std::marker::PhantomData }
     }
 }
 
-// Any type that implements clone can use a non-region that just clones items.
-impl<T: Clone> Region for CloneRegion<T> {
+// Any type that implements copy can use a non-region that just copies items.
+impl<T: Copy> Region for CopyRegion<T> {
     type Item = T;
     #[inline(always)]
     unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
-        item.clone()
+        *item
     }
     #[inline(always)]
     fn clear(&mut self) { }
@@ -456,13 +456,13 @@ mod columnstack {
 
 mod implementations {
 
-    use super::{Region, CloneRegion, StableRegion, Columnation, ColumnStack};
+    use super::{Region, CopyRegion, StableRegion, Columnation, ColumnStack};
 
     // Implementations for types whose `clone()` suffices for the region.
     macro_rules! implement_columnation {
         ($index_type:ty) => (
             impl Columnation for $index_type {
-                type InnerRegion = CloneRegion<$index_type>;
+                type InnerRegion = CopyRegion<$index_type>;
             }
         )
     }
