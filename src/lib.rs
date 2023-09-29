@@ -122,6 +122,10 @@ impl<T: Copy> Region for CopyRegion<T> {
     }
 }
 
+impl<T: Copy, const N: usize> Columnation for [T; N] {
+    type InnerRegion = CopyRegion<[T; N]>;
+}
+
 
 /// A region allocator which holds items at stable memory locations.
 ///
