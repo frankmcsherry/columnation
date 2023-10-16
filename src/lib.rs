@@ -123,6 +123,19 @@ impl<T: Copy> Region for CopyRegion<T> {
 }
 
 mod memory {
+    use std::os::fd::AsRawFd;
+    use std::sync::{OnceLock};
+    use crossbeam_channel::{unbounded, Sender, Receiver};
+    use memmap2::MmapMut;
+
+    static UNMAP_CHANNEL: OnceLock<(Sender<MmapMut>, Receiver<MmapMut>)> = OnceLock::new();
+
+    #[inline]
+    fn init() -> &'static (Sender<MmapMut>, Receiver<MmapMut>) {
+        UNMAP_CHANNEL.get_or_init({
+            unbounded
+        })
+    }
 
     /// An abstraction over different kinds of allocated regions.
     pub(crate) enum Region<T> {
@@ -131,7 +144,7 @@ mod memory {
         /// A heap-allocated region, represented as a vector.
         Heap(Vec<T>),
         /// A mmaped region, represented by a vector and its backing memory mapping.
-        MMap(Vec<T>, memmap2::MmapRaw),
+        MMap(Vec<T>, Option<MmapMut>),
     }
 
     impl<T> Default for Region<T> {
@@ -141,6 +154,8 @@ mod memory {
     }
 
     impl<T> Region<T> {
+        const MMAP_SIZE: usize = 2 << 20;
+
         /// Create a new empty region.
         pub(crate) fn new_nil() -> Region<T> {
             Region::Nil
@@ -154,17 +169,23 @@ mod memory {
         /// Create a new file-based mapped region of a specific capacity. The capacity of the
         /// returned region can be larger than requested to accommodate page sizes.
         pub(crate) fn new_mmap(capacity: usize) -> Region<T> {
-            let capacity = std::cmp::max(capacity, 1<<12 / std::mem::size_of::<T>());
-            let file = tempfile::tempfile().unwrap();
+            // Round up to at least a page.
+            let capacity = std::cmp::max(capacity, 0x1000 / std::mem::size_of::<T>());
             let byte_len = std::mem::size_of::<T>() * capacity;
+            if let Ok(mut mmap) = init().1.try_recv() {
+                assert_eq!(mmap.len(), byte_len);
+                let new_local = unsafe { Vec::from_raw_parts(mmap.as_mut_ptr() as *mut T, 0, capacity) };
+                return Region::MMap(new_local, Some(mmap))
+            }
+            let file = tempfile::tempfile().unwrap();
             let (mmap, new_local) = unsafe {
                 use std::os::unix::io::AsFd;
-                libc::fallocate(std::mem::transmute::<_, i32>(file.as_fd()), 0, 0, byte_len as i64);
-                let mmap = memmap2::MmapRaw::map_raw(&file).unwrap();
+                libc::fallocate(file.as_fd().as_raw_fd(), 0, 0, byte_len as i64);
+                let mut mmap = memmap2::MmapOptions::new().populate().map_mut(&file).unwrap();
                 let new_local = Vec::from_raw_parts(mmap.as_mut_ptr() as *mut T, 0, capacity);
                 (mmap, new_local)
             };
-            Region::MMap(new_local, mmap)
+            Region::MMap(new_local, Some(mmap))
         }
 
         /// Create a region depending on the capacity.
@@ -175,12 +196,16 @@ mod memory {
         /// Crates a [Region::Nil] for empty capacities, a [Region::Heap] for allocations up to 2
         /// Mib, and [Region::MMap] for larger capacities.
         pub(crate) fn new_auto(capacity: usize) -> Region<T> {
-            match capacity {
-                0 => Region::new_nil(),
-                capacity @ 1.. if std::mem::size_of::<T>() * capacity <= 2 << 20 => {
-                    Region::new_heap(capacity)
-                },
-                capacity => Region::new_mmap(capacity),
+            if std::mem::size_of::<T>() == 0 {
+                // Handle zero-sized types.
+                Region::new_heap(capacity)
+            } else {
+                let bytes = std::mem::size_of::<T>() * capacity;
+                match bytes {
+                    0 => Region::new_nil(),
+                    Self::MMAP_SIZE => Region::new_mmap(capacity),
+                    _ => Region::new_heap(capacity),
+                }
             }
         }
 
@@ -205,6 +230,14 @@ mod memory {
             match self {
                 Region::Nil => 0,
                 Region::Heap(vec) | Region::MMap(vec, _) => vec.len(),
+            }
+        }
+
+        /// Returns true if the region does not contain any elements.
+        pub(crate) fn is_empty(&self) -> bool {
+            match self {
+                Region::Nil => true,
+                Region::Heap(vec) | Region::MMap(vec, _) => vec.is_empty(),
             }
         }
 
@@ -239,10 +272,11 @@ mod memory {
                     // Unsafe reasoning: Don't drop the elements.
                     unsafe { vec.set_len(0) }
                 },
-                Region::MMap(vec, _mmap) => {
+                Region::MMap(vec, mmap) => {
                     // Forget reasoning: The vector points to the mapped region, which frees the
                     // allocation
                     std::mem::forget(std::mem::take(vec));
+                    let _ = init().0.send(mmap.take().unwrap());
                 }
             }
         }
@@ -294,7 +328,7 @@ impl<T> Default for StableRegion<T> {
         Self {
             local: memory::Region::Nil,
             stash: Vec::new(),
-            limit: usize::MAX,
+            limit: 2 << 20,
         }
     }
 }
@@ -305,7 +339,7 @@ impl<T> StableRegion<T> {
         Self {
             local: Default::default(),
             stash: Default::default(),
-            limit: limit,
+            limit,
         }
     }
 
@@ -470,6 +504,7 @@ mod columnstack {
         /// Copies an element in to the region.
         ///
         /// The element can be read by indexing
+        #[inline]
         pub fn copy(&mut self, item: &T) {
             // TODO: Some types `T` should just be cloned.
             // E.g. types that are `Copy` or vecs of ZSTs.
