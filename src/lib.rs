@@ -123,18 +123,196 @@ impl<T: Copy> Region for CopyRegion<T> {
 }
 
 mod memory {
-    use std::os::fd::AsRawFd;
-    use std::sync::{OnceLock};
-    use crossbeam_channel::{unbounded, Sender, Receiver};
-    use memmap2::MmapMut;
+    use std::collections::{HashMap};
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::sync::{Mutex, OnceLock, RwLock};
+    use std::thread::ThreadId;
+    use std::cell::RefCell;
+    use std::ffi::{CStr, OsStr};
+    use std::iter;
 
-    static UNMAP_CHANNEL: OnceLock<(Sender<MmapMut>, Receiver<MmapMut>)> = OnceLock::new();
+    use memmap2::MmapMut;
+    use crossbeam_deque::{Injector, Stealer, Worker};
+
+    type Mem = &'static mut [u8];
+
+    const LOCAL_BUFFER: usize = 32;
+
+    static THREAD_STEALERS: OnceLock<RwLock<HashMap<ThreadId, Vec<Option<Stealer<Mem>>>>>> = OnceLock::new();
+    static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
+
+    fn get_injector(size_class: usize) -> &'static Injector<Mem> {
+        let global = GlobalStealer::get();
+
+        &global.injectors[size_class].1
+    }
+
+    struct GlobalStealer {
+        injectors: Vec<(RwLock<Vec<MmapMut>>, Injector<&'static mut [u8]>)>,
+    }
+
+    impl GlobalStealer {
+        fn get() -> &'static Self {
+            INJECTOR.get_or_init(|| Self::new())
+        }
+
+        fn new() -> Self {
+            // 2MiB
+            // let size_class = 21;
+            // let byte_len = (1 << size_class) * 128;
+            //
+
+            let mut injectors = Vec::with_capacity(32);
+
+            for _ in 0..32 {
+                injectors.push(Default::default());
+            }
+
+            // let mut mmap = Self::init_file(byte_len);
+            // let area = unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr(), mmap.len()) };
+            // injectors[size_class] = (vec![mmap], Self::init_size_class(size_class, area));
+
+            Self { injectors }
+        }
+
+        fn try_refill(&self, size_class: usize) {
+
+            let (stash, injector) = &self.injectors[size_class];
+            let mut stash = stash.write().unwrap();
+
+            let byte_len = stash.iter().last().map(|mmap| mmap.len()).unwrap_or(32 << 20) * 2;
+
+            let mut mmap = Self::init_file(byte_len);
+            let area = unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr(), mmap.len()) };
+            println!("area {:?} {}", area.as_ptr(), area.len());
+            for slice in area.chunks_mut(1 << size_class) {
+                injector.push(slice);
+            }
+            stash.push(mmap);
+        }
+
+        fn init_file(byte_len: usize) -> MmapMut {
+            let file = tempfile::tempfile().unwrap();
+            unsafe {
+                libc::ftruncate(file.as_fd().as_raw_fd(), byte_len as libc::off_t);
+                let mut mmap = memmap2::MmapOptions::new().populate().map_mut(&file).unwrap();
+                let ret = libc::madvise(mmap.as_mut_ptr().cast(), mmap.len(), libc::MADV_COLLAPSE | libc::MADV_HUGEPAGE);
+                println!("ret: {ret} {:?}", std::io::Error::last_os_error().raw_os_error().map(|errno| (errno, CStr::from_ptr(libc::strerror(errno)))));
+                mmap
+            }
+        }
+    }
+
+    struct ThreadLocalStealer {
+        size_class: Vec<LocalSizeClass>,
+        thread_id: ThreadId,
+    }
+
+    struct LocalSizeClass {
+        worker: Worker<Mem>,
+        injector: &'static Injector<Mem>,
+        size_class: usize,
+    }
+
+    impl LocalSizeClass {
+        fn new(size_class: usize, thread_id: ThreadId) -> Self {
+            let worker = Worker::new_lifo();
+            let injector = get_injector(size_class);
+            println!("injector len: {}", injector.len());
+
+            let lock = THREAD_STEALERS.get_or_init(|| RwLock::new(Default::default()));
+            let mut lock = lock.write().unwrap();
+            let stealers = lock.entry(thread_id).or_default();
+            while stealers.len() <= size_class {
+                stealers.push(None);
+            }
+            stealers[size_class] = Some(worker.stealer());
+
+            Self { worker, injector, size_class }
+        }
+
+        fn get(&self) -> Option<Mem> {
+            self.worker
+                .pop()
+                .or_else(|| {
+                    iter::repeat_with(|| {
+                        self.injector.steal_batch_with_limit_and_pop(&self.worker, LOCAL_BUFFER / 2)
+                            .or_else(|| {
+                                THREAD_STEALERS
+                                    .get()
+                                    .unwrap()
+                                    .read()
+                                    .unwrap()
+                                    .values()
+                                    .flat_map(|s| s.get(self.size_class))
+                                    .flatten()
+                                    .map(Stealer::steal)
+                                    .collect()
+                            })
+                    })
+                        .find(|s| !s.is_retry())
+                        .and_then(|s| s.success())
+                })
+        }
+
+        fn try_refill(&self) {
+            GlobalStealer::get().try_refill(self.size_class);
+        }
+
+        fn get_with_refill(&self) -> Option<Mem> {
+            if let Some(mem) = self.get() {
+                return Some(mem);
+            }
+
+            self.try_refill();
+
+            self.get()
+        }
+
+        fn push(&self, mem: Mem) {
+            if self.worker.len() > LOCAL_BUFFER {
+                self.injector.push(mem);
+            } else {
+                self.worker.push(mem);
+            }
+        }
+    }
+
+    impl ThreadLocalStealer {
+        fn new() -> Self {
+            let thread_id = std::thread::current().id();
+            Self { size_class: vec![], thread_id }
+        }
+
+        fn get(&mut self, size_class: usize) -> Option<Mem> {
+            while self.size_class.len() <= size_class {
+                self.size_class.push(LocalSizeClass::new(self.size_class.len(), self.thread_id));
+            }
+
+            self.size_class[size_class].get_with_refill()
+        }
+
+        fn push(&self, mem: Mem) {
+            let size_class = mem.len().next_power_of_two().trailing_zeros() as usize;
+            self.size_class[size_class].push(mem);
+        }
+    }
+
+    impl Drop for ThreadLocalStealer {
+        fn drop(&mut self) {
+            if let Some(lock) = THREAD_STEALERS.get() {
+                lock.write().unwrap().remove(&self.thread_id);
+            }
+        }
+    }
+
+    thread_local! {
+        static WORKER: RefCell<ThreadLocalStealer> = RefCell::new(ThreadLocalStealer::new());
+    }
 
     #[inline]
-    fn init() -> &'static (Sender<MmapMut>, Receiver<MmapMut>) {
-        UNMAP_CHANNEL.get_or_init({
-            unbounded
-        })
+    fn with_stealer<R, F: FnMut(&mut ThreadLocalStealer) -> R>(mut f: F) -> R {
+        WORKER.with(|cell| f(&mut *cell.borrow_mut()))
     }
 
     /// An abstraction over different kinds of allocated regions.
@@ -144,7 +322,7 @@ mod memory {
         /// A heap-allocated region, represented as a vector.
         Heap(Vec<T>),
         /// A mmaped region, represented by a vector and its backing memory mapping.
-        MMap(Vec<T>, Option<MmapMut>),
+        MMap(Vec<T>, Option<Mem>),
     }
 
     impl<T> Default for Region<T> {
@@ -168,24 +346,19 @@ mod memory {
 
         /// Create a new file-based mapped region of a specific capacity. The capacity of the
         /// returned region can be larger than requested to accommodate page sizes.
-        pub(crate) fn new_mmap(capacity: usize) -> Region<T> {
+        pub(crate) fn new_mmap(capacity: usize) -> Option<Region<T>> {
             // Round up to at least a page.
-            let capacity = std::cmp::max(capacity, 0x1000 / std::mem::size_of::<T>());
-            let byte_len = std::mem::size_of::<T>() * capacity;
-            if let Ok(mut mmap) = init().1.try_recv() {
+            // let capacity = std::cmp::max(capacity, 0x1000 / std::mem::size_of::<T>());
+            let byte_len = std::cmp::min(0x1000, std::mem::size_of::<T>() * capacity);
+            let byte_len = byte_len.next_power_of_two();
+            let size_class = byte_len.trailing_zeros() as usize;
+            let actual_capacity = byte_len / std::mem::size_of::<T>();
+            with_stealer(|s| s.get(size_class)).map(|mmap|{
                 assert_eq!(mmap.len(), byte_len);
-                let new_local = unsafe { Vec::from_raw_parts(mmap.as_mut_ptr() as *mut T, 0, capacity) };
-                return Region::MMap(new_local, Some(mmap))
-            }
-            let file = tempfile::tempfile().unwrap();
-            let (mmap, new_local) = unsafe {
-                use std::os::unix::io::AsFd;
-                libc::fallocate(file.as_fd().as_raw_fd(), 0, 0, byte_len as i64);
-                let mut mmap = memmap2::MmapOptions::new().populate().map_mut(&file).unwrap();
-                let new_local = Vec::from_raw_parts(mmap.as_mut_ptr() as *mut T, 0, capacity);
-                (mmap, new_local)
-            };
-            Region::MMap(new_local, Some(mmap))
+                let new_local = unsafe { Vec::from_raw_parts(mmap.as_mut_ptr() as *mut T, 0, actual_capacity) };
+                assert!(std::mem::size_of::<T>() * new_local.len() <= mmap.len());
+                Region::MMap(new_local, Some(mmap))
+            })
         }
 
         /// Create a region depending on the capacity.
@@ -203,7 +376,10 @@ mod memory {
                 let bytes = std::mem::size_of::<T>() * capacity;
                 match bytes {
                     0 => Region::new_nil(),
-                    Self::MMAP_SIZE => Region::new_mmap(capacity),
+                    Self::MMAP_SIZE => Region::new_mmap(capacity).unwrap_or_else(|| {
+                        eprintln!("Mmap pool exhausted, falling back to heap.");
+                        Region::new_heap(capacity)
+                    }),
                     _ => Region::new_heap(capacity),
                 }
             }
@@ -276,7 +452,7 @@ mod memory {
                     // Forget reasoning: The vector points to the mapped region, which frees the
                     // allocation
                     std::mem::forget(std::mem::take(vec));
-                    let _ = init().0.send(mmap.take().unwrap());
+                    with_stealer(|s| s.push(std::mem::take(mmap).unwrap()))
                 }
             }
         }
