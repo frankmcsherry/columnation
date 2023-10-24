@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 paste = "1.0.6"
+rust-lgalloc = {git = "https://github.com/antiguru/rust-lgalloc"}

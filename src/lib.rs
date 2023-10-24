@@ -134,9 +134,9 @@ impl<T: Copy> Region for CopyRegion<T> {
 /// fixed memory locations.
 pub struct StableRegion<T> {
     /// The active allocation into which we are writing.
-    local: Vec<T>,
+    local: rust_lgalloc::Region<T>,
     /// All previously active allocations.
-    stash: Vec<Vec<T>>,
+    stash: Vec<rust_lgalloc::Region<T>>,
     /// The maximum allocation size
     limit: usize,
 }
@@ -145,7 +145,7 @@ pub struct StableRegion<T> {
 impl<T> Default for StableRegion<T> {
     fn default() -> Self {
         Self {
-            local: Vec::new(),
+            local: Default::default(),
             stash: Vec::new(),
             limit: usize::MAX,
         }
@@ -158,7 +158,7 @@ impl<T> StableRegion<T> {
         Self {
             local: Default::default(),
             stash: Default::default(),
-            limit: limit,
+            limit,
         }
     }
 
@@ -168,11 +168,9 @@ impl<T> StableRegion<T> {
         unsafe {
             // Unsafety justified in that setting the length to zero exposes
             // no invalid data.
-            self.local.set_len(0);
+            self.local.clear();
             // Release allocations in `stash` without dropping their elements.
-            for mut buffer in self.stash.drain(..) {
-                buffer.set_len(0);
-            }
+            self.stash.clear()
         }
     }
     /// Copies an iterator of items into the region.
@@ -210,12 +208,11 @@ impl<T> StableRegion<T> {
             let mut next_len = (self.local.capacity() + 1).next_power_of_two();
             next_len = std::cmp::min(next_len, self.limit);
             next_len = std::cmp::max(count, next_len);
-            let new_local = Vec::with_capacity(next_len);
-            if self.local.is_empty() {
-                self.local = new_local;
-            } else {
-                self.stash.push(std::mem::replace(&mut self.local, new_local));
+            let new_local = rust_lgalloc::Region::new_auto(next_len);
+            if !self.local.is_empty() {
+                self.stash.push(std::mem::take(&mut self.local));
             }
+            self.local = new_local;
         }
     }
 
