@@ -667,29 +667,29 @@ mod implementations {
         ///
         /// Items `T` are stored in stable contiguous memory locations,
         /// and then a `Vec<T>` referencing them is falsified.
-        pub struct VecRegion<R: Region> where R::Item: Columnation {
+        pub struct VecRegion<T: Columnation> {
             /// Region for stable memory locations for `T` items.
-            region: StableRegion<R::Item>,
+            region: StableRegion<T>,
             /// Any inner region allocations.
-            inner: <R::Item as Columnation>::InnerRegion,
+            inner: T::InnerRegion,
         }
 
         // Manually implement `Default` as `T` may not implement it.
-        impl<R: Region> Default for VecRegion<R> where R::Item: Columnation {
+        impl<T: Columnation> Default for VecRegion<T> {
             fn default() -> Self {
                 VecRegion {
-                    region: StableRegion::<R::Item>::default(),
-                    inner: <R::Item as Columnation>::InnerRegion::default(),
+                    region: StableRegion::<T>::default(),
+                    inner: T::InnerRegion::default(),
                 }
             }
         }
 
         impl<T: Columnation> Columnation for Vec<T> {
-            type InnerRegion = VecRegion<T::InnerRegion>;
+            type InnerRegion = VecRegion<T>;
         }
 
-        impl<R: Region> Region for VecRegion<R> where R::Item: Columnation {
-            type Item = Vec<R::Item>;
+        impl<T: Columnation> Region for VecRegion<T> {
+            type Item = Vec<T>;
             #[inline]
             fn clear(&mut self) {
                 self.region.clear();
@@ -728,20 +728,56 @@ mod implementations {
             }
         }
 
-        impl<'a, R, I> crate::CopyInto<VecRegion<R>> for I
+        impl<T, R> crate::CopyInto<VecRegion<R>> for Vec<T>
             where
-                R::Item: Columnation + 'a,
-                R: Region,
-                I: Iterator<Item=&'a R::Item> + ExactSizeIterator + Clone,
+                R: Columnation,
+                T: crate::CopyInto<R::InnerRegion>,
         {
             unsafe fn copy_into(this: &Self, target: &mut VecRegion<R>) -> <VecRegion<R> as Region>::Item {
-                // TODO: Some types `T` should just be cloned, with `copy_slice`.
-                // E.g. types that are `Copy` or vecs of ZSTs.
                 let inner = &mut target.inner;
-                let slice = target.region.copy_iter(this.clone().map(move |element| inner.copy(element)));
+                let slice = target.region.copy_iter(this.iter().map(move |element| crate::CopyInto::copy_into(element, inner)));
                 Vec::from_raw_parts(slice.as_mut_ptr(), this.len(), this.len())
             }
         }
+
+        impl<T, R> crate::CopyInto<VecRegion<R>> for [T]
+            where
+                R: Columnation,
+                T: crate::CopyInto<R::InnerRegion>,
+        {
+            unsafe fn copy_into(this: &Self, target: &mut VecRegion<R>) -> <VecRegion<R> as Region>::Item {
+                let inner = &mut target.inner;
+                let slice = target.region.copy_iter(this.iter().map(move |element| crate::CopyInto::copy_into(element, inner)));
+                Vec::from_raw_parts(slice.as_mut_ptr(), this.len(), this.len())
+            }
+        }
+
+        impl<T, R, const N: usize> crate::CopyInto<VecRegion<R>> for [T; N]
+            where
+                R: Columnation,
+                T: crate::CopyInto<R::InnerRegion>,
+        {
+            unsafe fn copy_into(this: &Self, target: &mut VecRegion<R>) -> <VecRegion<R> as Region>::Item {
+                let inner = &mut target.inner;
+                let slice = target.region.copy_iter(this.iter().map(move |element| crate::CopyInto::copy_into(element, inner)));
+                Vec::from_raw_parts(slice.as_mut_ptr(), this.len(), this.len())
+            }
+        }
+
+        // TODO: We could either have a blanket implementation for `Iterator`, or specific
+        // implementations for slice/array/vec, etc, but not both since they would be in conflict.
+        // impl<'a, T, R, I> crate::CopyInto<VecRegion<R>> for I
+        //     where
+        //         R: Columnation,
+        //         T: crate::CopyInto<R::InnerRegion> + 'a,
+        //         I: Iterator<Item=&'a T> + ExactSizeIterator + Clone,
+        // {
+        //     unsafe fn copy_into(this: &Self, target: &mut VecRegion<R>) -> <VecRegion<R> as Region>::Item {
+        //         let inner = &mut target.inner;
+        //         let slice = target.region.copy_iter(this.clone().map(move |element| crate::CopyInto::copy_into(element, inner)));
+        //         Vec::from_raw_parts(slice.as_mut_ptr(), this.len(), this.len())
+        //     }
+        // }
     }
 
     /// Implementation for `String`.
@@ -792,6 +828,13 @@ mod implementations {
             #[inline]
             fn heap_size(&self, callback: impl FnMut(usize, usize)) {
                 self.region.heap_size(callback)
+            }
+        }
+
+        impl crate::CopyInto<StringStack> for String {
+            unsafe fn copy_into(this: &Self, target: &mut StringStack) -> String {
+                let bytes = target.region.copy_slice(this.as_bytes());
+                String::from_raw_parts(bytes.as_mut_ptr(), this.len(), this.len())
             }
         }
 
@@ -855,6 +898,16 @@ mod implementations {
                 }
 
                 impl<$([<T $name>]: crate::CopyInto<$name>),*, $($name: Region),*> crate::CopyInto<[<Tuple $($name)* Region >]<$($name,)*>> for ($([<T $name >],)*) {
+                    #[allow(non_snake_case)]
+                    unsafe fn copy_into(this: &Self, region: &mut [<Tuple $($name)* Region >]<$($name,)*>) -> ($($name::Item,)*) {
+                        let ($($name,)*) = this;
+                        (
+                            $(crate::CopyInto::copy_into($name, &mut region.[<region $name>]),)*
+                        )
+                    }
+                }
+
+                impl<$([<T $name>]: crate::CopyInto<$name>),*, $($name: Region),*> crate::CopyInto<[<Tuple $($name)* Region >]<$($name,)*>> for &($([<T $name >],)*) {
                     #[allow(non_snake_case)]
                     unsafe fn copy_into(this: &Self, region: &mut [<Tuple $($name)* Region >]<$($name,)*>) -> ($($name::Item,)*) {
                         let ($($name,)*) = this;

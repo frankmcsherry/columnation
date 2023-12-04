@@ -25,11 +25,31 @@ fn copy_into() {
     let mut ts: ColumnStack<Option<String>> = ColumnStack::default();
     ts.copy_onto(&o);
 
+    let o = Some(1);
+    let mut ts: ColumnStack<Option<usize>> = ColumnStack::default();
+    ts.copy_onto(&o);
+
     let o = ("abc", "def");
     let mut ts: ColumnStack<(String, String)> = ColumnStack::default();
     ts.copy_onto(&o);
 
+    let o = ("abc", &o);
+    let mut ts: ColumnStack<(String, (String, String))> = ColumnStack::default();
+    ts.copy_onto(&o);
+
     let o: Result<_, ()> = Ok("asdf");
     let mut ts: ColumnStack<Result<String, ()>> = ColumnStack::default();
+    ts.copy_onto(&o);
+
+    let o = vec![("asdf", "def".to_string())];
+    let mut ts: ColumnStack<Vec<(String, String)>> = ColumnStack::default();
+    ts.copy_onto(&o);
+
+    let binding = ("asdf", Some("def".to_string()));
+    let o = vec![&binding];
+    let mut ts: ColumnStack<Vec<(String, Option<String>)>> = ColumnStack::default();
+    ts.copy_onto(&o);
+    let o = [&binding];
+    let mut ts: ColumnStack<Vec<(String, Option<String>)>> = ColumnStack::default();
     ts.copy_onto(&o);
 }
