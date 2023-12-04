@@ -18,3 +18,18 @@ fn _test_pass<T: Columnation+Eq>(record: T) {
         assert!(element == &record);
     }
 }
+
+#[test]
+fn copy_into() {
+    let o = Some("test");
+    let mut ts: ColumnStack<Option<String>> = ColumnStack::default();
+    ts.copy_onto(&o);
+
+    let o = ("abc", "def");
+    let mut ts: ColumnStack<(String, String)> = ColumnStack::default();
+    ts.copy_onto(&o);
+
+    let o: Result<_, ()> = Ok("asdf");
+    let mut ts: ColumnStack<Result<String, ()>> = ColumnStack::default();
+    ts.copy_onto(&o);
+}

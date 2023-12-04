@@ -261,11 +261,29 @@ pub trait Columnation: Sized {
     type InnerRegion: Region<Item = Self>;
 }
 
+/// A type that can be copied into a columnar region, possibly turning into a different type.
+///
+/// We do not provide a blanket implementation because it would conflict with more specific
+/// implementations.
+pub trait CopyInto<R: Region> {
+    /// Copy itself into a region.
+    ///
+    /// Defined not to operate on `self` to avoid namespace conflicts.
+    ///
+    /// # Safety
+    ///
+    /// The rules for [`Region::copy`] apply here, too. Specifically, it is
+    /// unsafe to use the result in any way other than to reference
+    /// its contents, and then only for the lifetime of the columnar region.
+    /// Correct uses of this method are very likely exclusive to this crate.
+    unsafe fn copy_into(this: &Self, target: &mut R) -> R::Item;
+}
+
 pub use columnstack::ColumnStack;
 
 mod columnstack {
 
-    use super::{Columnation, Region};
+    use super::{Columnation, CopyInto, Region};
 
     /// An append-only vector that store records as columns.
     ///
@@ -331,6 +349,12 @@ mod columnstack {
             unsafe {
                 self.local.push(self.inner.copy(item));
             }
+        }
+        /// Copies a [`CopyInto`] element into the region.
+        ///
+        /// The element can be read by indexing.
+        pub fn copy_onto<C: CopyInto<T::InnerRegion> + ?Sized>(&mut self, item: &C) {
+            self.local.push(unsafe { CopyInto::copy_into(item, &mut self.inner) });
         }
         /// Empties the collection.
         pub fn clear(&mut self) {
@@ -456,13 +480,19 @@ mod columnstack {
 
 mod implementations {
 
-    use super::{Region, CopyRegion, StableRegion, Columnation, ColumnStack};
+    use super::{Region, CopyInto, CopyRegion, StableRegion, Columnation, ColumnStack};
 
     // Implementations for types whose `clone()` suffices for the region.
     macro_rules! implement_columnation {
         ($index_type:ty) => (
             impl Columnation for $index_type {
                 type InnerRegion = CopyRegion<$index_type>;
+            }
+
+            impl CopyInto<CopyRegion<$index_type>> for $index_type {
+                unsafe fn copy_into(this: &Self, _target: &mut crate::CopyRegion<$index_type>) -> $index_type {
+                   *this
+                }
             }
         )
     }
@@ -498,7 +528,7 @@ mod implementations {
 
     /// Implementations for `Option<T: Columnation>`.
     pub mod option {
-
+        use crate::CopyInto;
         use super::{Columnation, Region};
 
         #[derive(Default)]
@@ -541,11 +571,26 @@ mod implementations {
         impl<T: Columnation> Columnation for Option<T> {
             type InnerRegion = OptionRegion<T::InnerRegion>;
         }
+        //
+        // impl<R: Region> CopyInto<OptionRegion<R>> for Option<&R::Item> {
+        //     unsafe fn copy_into(this: &Self, target: &mut OptionRegion<R>) -> <OptionRegion<R> as Region>::Item {
+        //         this.map(|inner| target.region.copy(inner))
+        //     }
+        // }
+
+        impl<T, R: Region> CopyInto<OptionRegion<R>> for Option<T>
+        where
+            T: CopyInto<R>,
+            R::Item: Columnation,
+        {
+            unsafe fn copy_into(this: &Self, target: &mut OptionRegion<R>) -> <OptionRegion<R> as Region>::Item {
+                this.as_ref().map(|inner| CopyInto::copy_into(inner, &mut target.region))
+            }
+        }
     }
 
     /// Implementations for `Result<T: Columnation, E: Columnation>`.
     pub mod result {
-
         use super::{Columnation, Region};
 
         #[derive(Default)]
@@ -598,40 +643,53 @@ mod implementations {
         impl<T: Columnation, E: Columnation> Columnation for Result<T, E> {
             type InnerRegion = ResultRegion<T::InnerRegion, E::InnerRegion>;
         }
+        impl<T1, T2, R1, R2> crate::CopyInto<ResultRegion<R1, R2>> for Result<T1, T2>
+        where
+            T1: crate::CopyInto<R1>,
+            T2: crate::CopyInto<R2>,
+            R1: Region,
+            R2: Region,
+        {
+            unsafe fn copy_into(this: &Self, target: &mut ResultRegion<R1, R2>) -> <ResultRegion<R1, R2> as Region>::Item {
+                match this {
+                    Ok(item) => { Ok(crate::CopyInto::copy_into(item, &mut target.region1)) },
+                    Err(item) => { Err(crate::CopyInto::copy_into(item, &mut target.region2)) },
+                }
+            }
+        }
     }
 
     /// Implementations for `Vec<T: Columnation>`.
     pub mod vec {
-
         use super::{Columnation, Region, StableRegion};
 
         /// Region allocation for the contents of `Vec<T>` types.
         ///
         /// Items `T` are stored in stable contiguous memory locations,
         /// and then a `Vec<T>` referencing them is falsified.
-        pub struct VecRegion<T: Columnation> {
+        pub struct VecRegion<R: Region> where R::Item: Columnation {
             /// Region for stable memory locations for `T` items.
-            region: StableRegion<T>,
+            region: StableRegion<R::Item>,
             /// Any inner region allocations.
-            inner: T::InnerRegion,
+            inner: <R::Item as Columnation>::InnerRegion,
         }
 
         // Manually implement `Default` as `T` may not implement it.
-        impl<T: Columnation> Default for VecRegion<T> {
+        impl<R: Region> Default for VecRegion<R> where R::Item: Columnation {
             fn default() -> Self {
                 VecRegion {
-                    region: StableRegion::<T>::default(),
-                    inner: T::InnerRegion::default(),
+                    region: StableRegion::<R::Item>::default(),
+                    inner: <R::Item as Columnation>::InnerRegion::default(),
                 }
             }
         }
 
         impl<T: Columnation> Columnation for Vec<T> {
-            type InnerRegion = VecRegion<T>;
+            type InnerRegion = VecRegion<T::InnerRegion>;
         }
 
-        impl<T: Columnation> Region for VecRegion<T> {
-            type Item = Vec<T>;
+        impl<R: Region> Region for VecRegion<R> where R::Item: Columnation {
+            type Item = Vec<R::Item>;
             #[inline]
             fn clear(&mut self) {
                 self.region.clear();
@@ -669,11 +727,25 @@ mod implementations {
                 self.region.heap_size(callback);
             }
         }
+
+        impl<'a, R, I> crate::CopyInto<VecRegion<R>> for I
+            where
+                R::Item: Columnation + 'a,
+                R: Region,
+                I: Iterator<Item=&'a R::Item> + ExactSizeIterator + Clone,
+        {
+            unsafe fn copy_into(this: &Self, target: &mut VecRegion<R>) -> <VecRegion<R> as Region>::Item {
+                // TODO: Some types `T` should just be cloned, with `copy_slice`.
+                // E.g. types that are `Copy` or vecs of ZSTs.
+                let inner = &mut target.inner;
+                let slice = target.region.copy_iter(this.clone().map(move |element| inner.copy(element)));
+                Vec::from_raw_parts(slice.as_mut_ptr(), this.len(), this.len())
+            }
+        }
     }
 
     /// Implementation for `String`.
     pub mod string {
-
         use super::{Columnation, Region, StableRegion};
 
         /// Region allocation for `String` data.
@@ -722,6 +794,27 @@ mod implementations {
                 self.region.heap_size(callback)
             }
         }
+
+        impl crate::CopyInto<StringStack> for &str {
+            unsafe fn copy_into(this: &Self, target: &mut StringStack) -> String {
+                let bytes = target.region.copy_slice(this.as_bytes());
+                String::from_raw_parts(bytes.as_mut_ptr(), this.len(), this.len())
+            }
+        }
+
+        impl crate::CopyInto<StringStack> for std::borrow::Cow<'_, str> {
+            unsafe fn copy_into(this: &Self, target: &mut StringStack) -> String {
+                let bytes = target.region.copy_slice(this.as_bytes());
+                String::from_raw_parts(bytes.as_mut_ptr(), this.len(), this.len())
+            }
+        }
+
+        impl crate::CopyInto<StringStack> for std::boxed::Box<str> {
+            unsafe fn copy_into(this: &Self, target: &mut StringStack) -> String {
+                let bytes = target.region.copy_slice(this.as_bytes());
+                String::from_raw_parts(bytes.as_mut_ptr(), this.len(), this.len())
+            }
+        }
     }
 
     /// Implementation for tuples.
@@ -759,6 +852,16 @@ mod implementations {
             ( $($name:ident)+) => ( paste! {
                 impl<$($name: Columnation),*> Columnation for ($($name,)*) {
                     type InnerRegion = [<Tuple $($name)* Region >]<$($name::InnerRegion,)*>;
+                }
+
+                impl<$([<T $name>]: crate::CopyInto<$name>),*, $($name: Region),*> crate::CopyInto<[<Tuple $($name)* Region >]<$($name,)*>> for ($([<T $name >],)*) {
+                    #[allow(non_snake_case)]
+                    unsafe fn copy_into(this: &Self, region: &mut [<Tuple $($name)* Region >]<$($name,)*>) -> ($($name::Item,)*) {
+                        let ($($name,)*) = this;
+                        (
+                            $(crate::CopyInto::copy_into($name, &mut region.[<region $name>]),)*
+                        )
+                    }
                 }
 
                 #[allow(non_snake_case)]
