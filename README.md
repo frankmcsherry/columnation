@@ -1,6 +1,14 @@
 # Columnation
 An experimental columnar arena
 
+## Alternatives
+
+Columnation presents unsafe code as if it were safe, which means it has the potential to be unsound.
+Its public interface has unsafe methods, which means you need to understand Rust's requirements for unsafe code or risk unsoundness yourself.
+For alternatives with less unsafety (but other trade-offs) consider [columnar](https://github.com/frankmcsherry/columnar) or [flatcontainer](https://github.com/antiguru/flatcontainer).
+
+## Overview
+
 Columnation borrows its name from [Abomonation](https://github.com/TimelyDataflow/abomonation), a Rust serialization framework that is very fast and very unsafe. Among Abomonation's unsafeties, it hosts typed data backed by `[u8]` slices, which causes anxiety for folks who worry about alignment, the visibility of padding bytes, and likely other things I don't yet know about.
 
 Columnation is slightly better, in that it only maintains typed allocations `Vec<T>`, and does not invoke `mem::transmute` to change types. This does not mean it is *safe*, just that there are fewer places in the code that are likely to be unsafe once Rust's unsafety story shakes out.
