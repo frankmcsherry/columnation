@@ -671,17 +671,20 @@ mod implementations {
         }
     }
 
-    /// Implementations for `Vec<T: Columnation>`.
+    /// Implementations for `SmallVec<[T: Columnation; K: usize]>`.
+    ///
+    /// This parallels the `Vec` implementation, but only moves data to the stable region if
+    /// the smallvec spills from its inline storage.
     pub mod smallvec {
 
         use smallvec::SmallVec;
 
         use super::{Columnation, Region, StableRegion};
 
-        /// Region allocation for the contents of `SmallVec<T>` types.
+        /// Region allocation for the contents of `SmallVec<[T; K]>` types.
         ///
         /// Items `T` are stored in stable contiguous memory locations,
-        /// and then a `Vec<T>` referencing them is falsified.
+        /// and then a `SmallVec<[T; K]>` referencing them is falsified.
         pub struct SmallVecRegion<T: Columnation, const K: usize> {
             /// Region for stable memory locations for `T` items.
             region: StableRegion<T>,
