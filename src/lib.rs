@@ -671,6 +671,82 @@ mod implementations {
         }
     }
 
+    /// Implementations for `Vec<T: Columnation>`.
+    pub mod smallvec {
+
+        use smallvec::SmallVec;
+
+        use super::{Columnation, Region, StableRegion};
+
+        /// Region allocation for the contents of `SmallVec<T>` types.
+        ///
+        /// Items `T` are stored in stable contiguous memory locations,
+        /// and then a `Vec<T>` referencing them is falsified.
+        pub struct SmallVecRegion<T: Columnation, const K: usize> {
+            /// Region for stable memory locations for `T` items.
+            region: StableRegion<T>,
+            /// Any inner region allocations.
+            inner: T::InnerRegion,
+        }
+
+        // Manually implement `Default` as `T` may not implement it.
+        impl<T: Columnation, const K: usize> Default for SmallVecRegion<T, K> {
+            fn default() -> Self {
+                SmallVecRegion {
+                    region: StableRegion::<T>::default(),
+                    inner: T::InnerRegion::default(),
+                }
+            }
+        }
+
+        impl<T: Columnation+Clone, const K: usize> Columnation for SmallVec<[T; K]> {
+            type InnerRegion = SmallVecRegion<T, K>;
+        }
+
+        impl<T: Columnation+Clone, const K: usize> Region for SmallVecRegion<T, K> {
+            type Item = SmallVec<[T; K]>;
+            #[inline]
+            fn clear(&mut self) {
+                self.region.clear();
+                self.inner.clear();
+            }
+            #[inline(always)]
+            unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
+                // TODO: Some types `T` should just be cloned, with `copy_slice`.
+                // E.g. types that are `Copy` or vecs of ZSTs.
+                let inner = &mut self.inner;
+                if item.spilled() {
+                    let slice = self.region.copy_iter(item.iter().map(|element| inner.copy(element)));
+                    SmallVec::from_raw_parts(slice.as_mut_ptr(), item.len(), item.len())
+                }
+                else { item.clone() }
+            }
+            #[inline(always)]
+            fn reserve_items<'a, I>(&mut self, items: I)
+            where
+                Self: 'a,
+                I: Iterator<Item=&'a Self::Item>+Clone,
+            {
+                self.region.reserve(items.clone().count());
+                self.inner.reserve_items(items.filter(|x| x.spilled()).flat_map(|x| x.iter()));
+            }
+
+            fn reserve_regions<'a, I>(&mut self, regions: I)
+            where
+                Self: 'a,
+                I: Iterator<Item = &'a Self> + Clone,
+            {
+                self.region.reserve(regions.clone().map(|r| r.region.len()).sum());
+                self.inner.reserve_regions(regions.map(|r| &r.inner));
+            }
+            #[inline]
+            fn heap_size(&self, mut callback: impl FnMut(usize, usize)) {
+                self.inner.heap_size(&mut callback);
+                self.region.heap_size(callback);
+            }
+        }
+    }
+
     /// Implementation for `String`.
     pub mod string {
 
