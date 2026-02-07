@@ -720,7 +720,7 @@ mod implementations {
                 let inner = &mut self.inner;
                 if item.spilled() {
                     let slice = self.region.copy_iter(item.iter().map(|element| inner.copy(element)));
-                    SmallVec::from_raw_parts(slice.as_mut_ptr(), item.len(), item.len())
+                    SmallVec::from_raw_parts(slice.as_mut_ptr(), item.len(), item.capacity())
                 }
                 else { item.clone() }
             }
