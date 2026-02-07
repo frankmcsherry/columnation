@@ -718,11 +718,20 @@ mod implementations {
                 // TODO: Some types `T` should just be cloned, with `copy_slice`.
                 // E.g. types that are `Copy` or vecs of ZSTs.
                 let inner = &mut self.inner;
-                if item.spilled() {
-                    let slice = self.region.copy_iter(item.iter().map(|element| inner.copy(element)));
-                    SmallVec::from_raw_parts(slice.as_mut_ptr(), item.len(), item.capacity())
+                let elements = item.iter().map(|element| inner.copy(element));
+                if item.len() <= item.inline_size() {
+                    // The resulting SmallVec should not spill, so we avoid `from_iter` and friends
+                    // because they try to use the iterator's `size_hint` method to right-size the
+                    // capacity. If the hint is too large we could end up accidentally spilling.
+                    let mut item_new = SmallVec::new();
+                    for element in elements {
+                        item_new.push(element);
+                    }
+                    item_new
+                } else {
+                    let slice = self.region.copy_iter(elements);
+                    SmallVec::from_raw_parts(slice.as_mut_ptr(), item.len(), item.len())
                 }
-                else { item.clone() }
             }
             #[inline(always)]
             fn reserve_items<'a, I>(&mut self, items: I)
