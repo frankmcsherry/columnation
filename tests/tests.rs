@@ -6,6 +6,14 @@ use columnation::*;
 #[test] fn test_u64_pass() { _test_pass(vec![0u64; 1024]); }
 #[test] fn test_string_pass() { _test_pass(vec![format!("grawwwwrr!"); 1024]); }
 #[test] fn test_vec_u_s_pass() { _test_pass(vec![vec![(0u64, format!("grawwwwrr!")); 32]; 32]); }
+#[test]
+fn test_smallvec() {
+    use smallvec::SmallVec;
+    let mut v: SmallVec<[i32; 1]> = SmallVec::with_capacity(2);
+    assert!(v.spilled());
+    v.push(42);
+    _test_pass(v);
+}
 
 fn _test_pass<T: Columnation+Eq>(record: T) {
 
