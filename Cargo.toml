@@ -1,6 +1,6 @@
 [package]
 name = "columnation"
-version = "0.1.0"
+version = "0.1.2"
 authors = ["Frank McSherry <fmcsherry@me.com>"]
 description = "Unsafe columnar containers for native Rust types"
 edition = "2018"
