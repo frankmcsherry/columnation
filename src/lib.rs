@@ -727,6 +727,7 @@ mod implementations {
                     for element in elements {
                         item_new.push(element);
                     }
+                    assert!(!item_new.spilled());
                     item_new
                 } else {
                     let slice = self.region.copy_iter(elements);
