@@ -17,18 +17,50 @@
 /// This type will ensure that absorbed data remain valid as long as the
 /// instance itself is valid. Responsible users will couple the lifetime
 /// of this instance with that of *all* instances it returns from `copy`.
+///
+/// # Implementing `Region`
+///
+/// Implementations that return falsified values from `copy` (values whose
+/// allocations are owned by the region, rather than by the values) must
+/// uphold the following, or safe uses of [`ColumnStack`] can cause undefined
+/// behavior:
+///
+/// * Never drop a falsified value, including while unwinding from a panic.
+///   Inner regions may panic in `copy` or `clear`. If `copy` assembles a value
+///   from several falsified parts, hold the finished parts in `ManuallyDrop`
+///   until the value is complete, as the tuple regions do.
+/// * Never drop the falsified values the region stores itself. A region can be
+///   dropped without a prior call to `clear` (for example, when a sibling
+///   region's `clear` panics), so discard stored falsified values without
+///   dropping them in a `Drop` implementation, as `VecRegion` does for the
+///   elements in its [`StableRegion`].
+/// * Do not move or release memory that falsified values reference until the
+///   region is cleared or dropped. [`StableRegion`] provides this.
+/// * Do not form a `&mut` reference covering memory that outstanding falsified
+///   values reference, as under Rust's aliasing rules this invalidates their
+///   pointers. Derive pointers with `as_mut_ptr` rather than by indexing.
+/// * Do not place falsified values where a shared reference could move them out,
+///   such as in a `Cell` or `RefCell`, as [`ColumnStack`] hands out shared
+///   references to its elements.
+///
+/// Falsifying a `Vec` or `String` with `from_raw_parts`, as this crate does,
+/// already violates those functions' documented requirements, as the pointer
+/// was not allocated with that capacity. It works only because the falsified
+/// value is never dropped, grown, or otherwise asked to manage its allocation.
 pub trait Region : Default {
     /// The type of item the region contains.
     type Item;
     /// Add a new element to the region.
     ///
     /// The argument will be copied in to the region and returned as an
-    /// owned instance. It is unsafe to unwrap and then drop the result.
+    /// owned instance, whose allocations are falsified and owned by the region.
     ///
     /// # Safety
     ///
     /// It is unsafe to use the result in any way other than to reference
-    /// its contents, and then only for the lifetime of the columnar region.
+    /// its contents, and then only until the region is next cleared or dropped.
+    /// In particular, the result must not be dropped, mutated, or have any
+    /// of its contents moved out (e.g. through interior mutability).
     /// Correct uses of this method are very likely exclusive to this crate.
     unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item;
     /// Retain allocations but discard their contents.
@@ -132,6 +164,11 @@ impl<T: Copy> Region for CopyRegion<T> {
 /// itself intend to implement `Region`. Rather, it is a useful building
 /// block for other less-safe code that wants allocated data to remain at
 /// fixed memory locations.
+///
+/// Dropping the region drops its items, but `clear` does not. Code that
+/// stores falsified items in a `StableRegion` must clear it before it is
+/// dropped, in its own `Drop` implementation as `VecRegion` does, rather
+/// than relying on callers to call `clear`. See [`Region`].
 pub struct StableRegion<T> {
     /// The active allocation into which we are writing.
     local: Vec<T>,
@@ -181,10 +218,21 @@ impl<T> StableRegion<T> {
     where
         I: Iterator<Item = T> + std::iter::ExactSizeIterator,
     {
-        self.reserve(items.len());
+        // `ExactSizeIterator` is a safe trait, and may lie. Never write more than we have
+        // reserved, as reallocating `self.local` would move items that must not move.
+        let count = items.len();
+        self.reserve(count);
         let initial_len = self.local.len();
-        self.local.extend(items);
-        &mut self.local[initial_len ..]
+        let mut written = 0;
+        for (slot, item) in self.local.spare_capacity_mut()[.. count].iter_mut().zip(items) {
+            slot.write(item);
+            written += 1;
+        }
+        unsafe {
+            // Unsafety justified in that we have initialized the first `written` spare items.
+            self.local.set_len(initial_len + written);
+        }
+        self.tail(initial_len)
     }
     /// Copies a slice of cloneable items into the region.
     #[inline]
@@ -195,7 +243,21 @@ impl<T> StableRegion<T> {
         self.reserve(items.len());
         let initial_len = self.local.len();
         self.local.extend_from_slice(items);
-        &mut self.local[initial_len ..]
+        self.tail(initial_len)
+    }
+
+    /// The items of `self.local` from `initial_len` onward.
+    ///
+    /// Indexing `self.local` would produce a `&mut [T]` covering all of its items, which
+    /// invalidates pointers previously handed out to its items (under Stacked Borrows).
+    #[inline(always)]
+    fn tail(&mut self, initial_len: usize) -> &mut [T] {
+        let len = self.local.len() - initial_len;
+        unsafe {
+            // Unsafety justified in that `initial_len .. self.local.len()` are initialized
+            // items of `self.local`, and `as_mut_ptr` does not materialize a reference.
+            std::slice::from_raw_parts_mut(self.local.as_mut_ptr().add(initial_len), len)
+        }
     }
 
     /// Ensures that there is space in `self.local` to copy at least `count` items.
@@ -248,6 +310,7 @@ impl<T> StableRegion<T> {
         }
     }
 }
+
 
 
 /// A type that can be stored in a columnar region.
@@ -630,6 +693,13 @@ mod implementations {
             type InnerRegion = VecRegion<T>;
         }
 
+        impl<T: Columnation> Drop for VecRegion<T> {
+            fn drop(&mut self) {
+                // The items in `self.region` are falsified, and must not be dropped.
+                self.region.clear();
+            }
+        }
+
         impl<T: Columnation> Region for VecRegion<T> {
             type Item = Vec<T>;
             #[inline]
@@ -706,6 +776,13 @@ mod implementations {
             type InnerRegion = SmallVecRegion<T, K>;
         }
 
+        impl<T: Columnation, const K: usize> Drop for SmallVecRegion<T, K> {
+            fn drop(&mut self) {
+                // The items in `self.region` are falsified, and must not be dropped.
+                self.region.clear();
+            }
+        }
+
         impl<T: Columnation+Clone, const K: usize> Region for SmallVecRegion<T, K> {
             type Item = SmallVec<[T; K]>;
             #[inline]
@@ -723,12 +800,13 @@ mod implementations {
                     // The resulting SmallVec should not spill, so we avoid `from_iter` and friends
                     // because they try to use the iterator's `size_hint` method to right-size the
                     // capacity. If the hint is too large we could end up accidentally spilling.
-                    let mut item_new = SmallVec::new();
+                    // Should a copy panic, the copied elements must not be dropped.
+                    let mut item_new = std::mem::ManuallyDrop::new(SmallVec::new());
                     for element in elements {
                         item_new.push(element);
                     }
                     assert!(!item_new.spilled());
-                    item_new
+                    std::mem::ManuallyDrop::into_inner(item_new)
                 } else {
                     let slice = self.region.copy_iter(elements);
                     SmallVec::from_raw_parts(slice.as_mut_ptr(), item.len(), item.len())
@@ -860,8 +938,10 @@ mod implementations {
                 impl<$($name: Region),*> [<Tuple $($name)* Region>]<$($name),*> {
                     #[allow(clippy::too_many_arguments)]
                     #[inline] pub unsafe fn copy_destructured(&mut self, $([<r $name>]: &$name::Item),*) -> <[<Tuple $($name)* Region>]<$($name),*> as Region>::Item {
+                        // Should a copy panic, the fields already copied must not be dropped.
+                        $(let [<r $name>] = std::mem::ManuallyDrop::new(self.[<region $name>].copy(&[<r $name>]));)*
                         (
-                            $(self.[<region $name>].copy(&[<r $name>]),)*
+                            $(std::mem::ManuallyDrop::into_inner([<r $name>]),)*
                         )
                     }
                 }
@@ -875,9 +955,7 @@ mod implementations {
                     }
                     #[inline] unsafe fn copy(&mut self, item: &Self::Item) -> Self::Item {
                         let ($(ref $name,)*) = *item;
-                        (
-                            $(self.[<region $name>].copy($name),)*
-                        )
+                        self.copy_destructured($($name),*)
                     }
                     #[inline(always)]
                     fn reserve_items<'a, It>(&mut self, items: It)
@@ -910,6 +988,11 @@ mod implementations {
         /// It assumes there are two fields on `self`:
         /// * `local`: A type supporting `push(T)`, e.g, `Vec`.
         /// * `inner`: A region of type `T`.
+        ///
+        /// The items in `local` are falsified and must never be dropped. The stack should
+        /// discard them without dropping them before clearing `inner`, and do so when it is
+        /// dropped, as `ColumnStack` does.
+        ///
         /// We're exporting this macro so custom `ColumnStack` implementations can benefit from it.
         #[macro_export]
         macro_rules! tuple_column_stack {
