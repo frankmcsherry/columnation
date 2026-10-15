@@ -362,8 +362,9 @@ mod columnstack {
         /// The argument `items` may be cloned and iterated multiple times.
         /// Please be careful if it contains side effects.
         #[inline(always)]
-        pub fn reserve_items<'a, I>(&'a mut self, items: I)
+        pub fn reserve_items<'a, I>(&mut self, items: I)
         where
+            T: 'a,
             I: Iterator<Item= &'a T>+Clone,
         {
             self.local.reserve(items.clone().count());
@@ -721,7 +722,10 @@ mod implementations {
                 Self: 'a,
                 I: Iterator<Item=&'a Self::Item>+Clone,
             {
-                self.region.reserve(items.clone().count());
+                // Zero-sized elements need no space, and their lengths can sum past `usize::MAX`.
+                if std::mem::size_of::<T>() > 0 {
+                    self.region.reserve(items.clone().map(|x| x.len()).sum());
+                }
                 self.inner.reserve_items(items.flat_map(|x| x.iter()));
             }
 
@@ -818,8 +822,10 @@ mod implementations {
                 Self: 'a,
                 I: Iterator<Item=&'a Self::Item>+Clone,
             {
-                self.region.reserve(items.clone().count());
-                self.inner.reserve_items(items.filter(|x| x.spilled()).flat_map(|x| x.iter()));
+                // Only items longer than the inline capacity are copied into `self.region`,
+                // but the elements of all items are copied into `self.inner`.
+                self.region.reserve(items.clone().filter(|x| x.len() > x.inline_size()).map(|x| x.len()).sum());
+                self.inner.reserve_items(items.flat_map(|x| x.iter()));
             }
 
             fn reserve_regions<'a, I>(&mut self, regions: I)
