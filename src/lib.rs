@@ -8,9 +8,23 @@
 //!
 //! # Safety
 //!
-//! This crate is wildly unsafe, on account of it uses the `unsafe`
-//! keyword and Rust's safety is not yet clearly enough specified
-//! for me to make any stronger statements than that.
+//! The safe interface is [`ColumnStack`]. Records copied into it are
+//! *falsified*: their pointers reference allocations owned by the stack's
+//! regions, rather than allocations of their own. They are only presented
+//! through shared references, and are never mutated or dropped.
+//!
+//! Falsifying a `Vec`, `String`, or `SmallVec` calls its `from_raw_parts`
+//! with a pointer that was not allocated with the claimed capacity, which
+//! violates that function's documented requirements. Nothing goes wrong as
+//! long as the value is never dropped, grown, or otherwise asked to manage
+//! its allocation, but the standard library does not promise this.
+//!
+//! [`Region::copy`] is unsafe to call, and implementations of [`Region`]
+//! take on the obligations listed in its documentation.
+//!
+//! The tests in `tests/soundness.rs` pass under Miri with both the Stacked
+//! Borrows and Tree Borrows aliasing models. Rust's aliasing rules are not
+//! yet settled, so this is evidence rather than proof.
 
 /// A type that can absorb owned data from type `T`.
 ///
@@ -67,8 +81,9 @@ pub trait Region : Default {
     ///
     /// The elements in the region do not actually own resources, and
     /// their normal `Drop` implementations will not be called. This method
-    /// should only be called after all instances returned by `copy` have
-    /// been disposed of, as this method may invalidate their contents.
+    /// should only be called once all instances returned by `copy` are no
+    /// longer used (they must be forgotten, never dropped), as this method
+    /// may invalidate their contents.
     fn clear(&mut self);
 
     /// Ensure that the region can absorb `items` without reallocation.
