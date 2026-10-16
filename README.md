@@ -94,4 +94,12 @@ Whereas Abomonation serializes each record contiguously, Columnation "serializes
 
 ## Safety
 
-Part of the goal of pushing the code is to get some eyes on it. It could be safe, but I am not clear on the pointer aliasing rules required for safety (nor where they are recorded). Also, there could totally be bugs, but I should fix those.
+The safe interface is `ColumnStack`. A record copied into it is *falsified*: it is an instance of its type (e.g. a `Vec<String>`) whose pointers reference memory owned by the stack's regions, rather than allocations of its own. Falsified records are only presented through shared references, are never mutated, and are never dropped; the regions release the memory themselves.
+
+This relies on a few things you should know about:
+
+* **Falsified values violate the documented requirements of `Vec::from_raw_parts`, `String::from_raw_parts`, and `SmallVec::from_raw_parts`**, as their pointers were not allocated with the capacities they claim. Nothing goes wrong as long as a falsified value is never dropped, grown, or otherwise asked to manage its allocation, and columnation ensures that, but the standard library does not promise it. Every use of `ColumnStack` relies on this.
+* **`Region::copy` is unsafe to call.** Its result may only be used through references, and only until the region is next cleared or dropped.
+* **Implementations of `Region` take on obligations**, listed in the documentation of the `Region` trait: never drop a falsified value (including when unwinding from a panic, and when a region is dropped without being cleared), never move or release memory that falsified values reference, and never form a `&mut` reference to that memory while they are live. The regions columnation provides uphold these.
+
+The tests in `tests/soundness.rs` reproduce problems that have been found and fixed. They only detect those problems under [Miri](https://github.com/rust-lang/miri), with `cargo +nightly miri test --test soundness`, and pass under both its Stacked Borrows and Tree Borrows (`MIRIFLAGS=-Zmiri-tree-borrows`) aliasing models. Rust's aliasing rules are not yet settled, so this is evidence rather than proof.
